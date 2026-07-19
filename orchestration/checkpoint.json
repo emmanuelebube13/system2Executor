@@ -1,0 +1,228 @@
+{
+  "history": [
+    {
+      "ts_utc": "2026-06-29T20:50:00Z",
+      "agent": "Tier-0 Orchestrator / Principal Architect",
+      "phase_or_task": "PHASE-0",
+      "step": "Completed Phase-0 artifact set; stopping for human sign-off (D-003).",
+      "status": "awaiting_human",
+      "intent": "Phase 0 design done. Need human approval (D-003) before any EXEC build task; then run AG-EXEC-000 and start EXEC-001 + EXEC-003.",
+      "side_effects_in_flight": [],
+      "verify_on_resume": [
+        "Check DECISIONS_LOG.md D-003 status — if still PENDING, do NOT start EXEC build; ask the human.",
+        "Confirm all Phase-0 files exist: ARCHITECTURE.md, docs/SYSTEM_BOUNDARY.md, docs/STORAGE_AND_QUEUE_ABSTRACTION.md, docs/FILE_MIGRATION_MANIFEST.md, config/.env.system2.template, .gitignore, orchestration/*."
+      ],
+      "files_touched": [
+        "docs/SYSTEM_BOUNDARY.md, docs/STORAGE_AND_QUEUE_ABSTRACTION.md, docs/FILE_MIGRATION_MANIFEST.md (written)",
+        "ARCHITECTURE.md, config/.env.system2.template, .gitignore (written)",
+        "orchestration/DECISIONS_LOG.md, FOLDER_STRUCTURE.md, AGENT_FLEET_TOPOLOGY.md, CONTINUATION_PROMPT.md, progress_ledger.json, PROGRESS_LEDGER.md (written)",
+        "docs/README.md, docs/00-*.md, docs/tasks/0*.md, docs/skills/*.md (copied from monolith)"
+      ],
+      "open_gates_or_blocks": ["AG-EXEC-000 not yet run; blocked on human D-003 sign-off"],
+      "do_not_repeat": [
+        "Do NOT re-decide D-001 (local datastore) or D-002 (Pub/Sub).",
+        "Do NOT re-copy specs/skills — already in docs/.",
+        "Do NOT edit any file under scalable-brain/ (originals stay runnable for dual-run)."
+      ],
+      "resume_pointer": "ledger event-id 6; CONTINUATION_PROMPT.md 'Current state'"
+    },
+    {
+      "ts_utc": "2026-06-30T12:40:00Z",
+      "agent": "Tier-0 Orchestrator / Execution-Core",
+      "phase_or_task": "EXEC-004 + EXEC-005",
+      "step": "Queue cluster complete: common/queue_backend.py (LocalDurableBackend SQLite+DLQ, PubSubBackend lazy, make_envelope, build_queue); EXEC-004 validation.py (envelope+TTL+last-line §7.2) + outbound_consumer.py (persistent dedup, DLQ, session park, ack-after-durable, lag); EXEC-005 fill_producer.py (FillResult, persist-then-publish outbox, retry-forever flush, control events). validate_fn + Decision.REJECTED_VALIDATION wired additively into pipeline.process.",
+      "status": "completed",
+      "intent": "Next: EXEC-006 broker adapter (provides real submit_fn + FillResult + reconcile) and EXEC-007 active position manager; then EXEC-008 staleness PAUSE (uses consumer.lag), EXEC-009 telemetry, EXEC-010 emergency STOP + lifecycle.",
+      "side_effects_in_flight": [],
+      "verify_on_resume": [
+        "cd system-2-execution-engine && PYTHONPATH=src SYSTEM2_ENV_FILE=/nonexistent.env /home/emmanuel/Documents/Scalable_Brain/.venv/bin/python -m pytest src -q -> expect 82 passed.",
+        "Gates: grep shows zero monolith imports in src/system2; no hardcoded secrets in new files."
+      ],
+      "files_touched": [
+        "src/system2/common/queue_backend.py (written prior step)",
+        "src/system2/execution/validation.py, outbound_consumer.py, fill_producer.py (written)",
+        "src/system2/execution/pipeline.py (additive: Decision.REJECTED_VALIDATION + validate_fn param)",
+        "src/system2/common/tests/test_queue_backend.py, execution/tests/test_validation.py, test_outbound_consumer.py, test_fill_producer.py (written)",
+        "orchestration/PROGRESS_LEDGER.md, CHECKPOINT.md, checkpoint.json (updated)"
+      ],
+      "open_gates_or_blocks": ["AG-EXEC-004/005 green; EXEC-006/007 unblocked; submit_fn/persist_fn injected by tests only until EXEC-006"],
+      "do_not_repeat": [
+        "Do NOT re-decide D-001/D-002/D-003.",
+        "Do NOT change pipeline's mark-on-EXECUTED-only behavior (crash-safety depends on it).",
+        "Do NOT flip EXEC-003 out of shadow until EXEC-006/008/010 green AND a logged human cutover decision.",
+        "Do NOT edit scalable-brain/ originals."
+      ],
+      "resume_pointer": "ledger event-id 12; CHECKPOINT.md 'intent'"
+    },
+    {
+      "ts_utc": "2026-06-30T13:20:00Z",
+      "agent": "Tier-0 Orchestrator / Broker",
+      "phase_or_task": "EXEC-006 + EXEC-007",
+      "step": "Broker cluster: oanda_adapter.py (pip/slippage/client-id math, idempotent submit w/ reconcile-before-retry, 2-pip slippage flag, stop/TP confirm-or-unsafe, practice/live fail-closed toggle) over an OandaTransport seam; oanda_transport.py (live REST, lazy oandapyV20, transient/market-closed mapping); position_manager.py (pure rule engine: R-multiple, breakeven-once/forward-only + _R_EPS float guard, trailing-tighten-only, 50/75/100% time exits; PositionManager routes idempotent stop/close via adapter, emits EXEC-005 on force-close).",
+      "status": "completed",
+      "intent": "Next: EXEC-008 staleness PAUSE + BYPASS (consumes OutboundConsumer.lag, emits control via FillProducer.emit_control); then EXEC-009 telemetry/health, EXEC-010 emergency STOP + lifecycle glue wiring OandaAdapter.submit into OutboundConsumer as submit_fn.",
+      "side_effects_in_flight": [],
+      "verify_on_resume": [
+        "cd system-2-execution-engine && PYTHONPATH=src SYSTEM2_ENV_FILE=/nonexistent.env /home/emmanuel/Documents/Scalable_Brain/.venv/bin/python -m pytest src -q -> expect 108 passed.",
+        "Gates: zero monolith imports in src/system2/broker; no hardcoded secrets; oandapyV20 not eagerly imported; live refused without creds."
+      ],
+      "files_touched": [
+        "src/system2/broker/oanda_adapter.py, oanda_transport.py, position_manager.py (written)",
+        "src/system2/broker/tests/test_oanda_adapter.py, test_position_manager.py (written)",
+        "orchestration/PROGRESS_LEDGER.md, CHECKPOINT.md, checkpoint.json (updated)"
+      ],
+      "open_gates_or_blocks": ["AG-EXEC-006/007 green; EXEC-008 unblocked; OandaAdapter.submit not yet wired into OutboundConsumer (deferred to EXEC-010 lifecycle glue)"],
+      "do_not_repeat": [
+        "Do NOT re-decide D-001/D-002/D-003.",
+        "Keep the adapter SDK-free/unit-testable (no eager oandapyV20 import); network stays behind OandaTransport.",
+        "Adapter trusts units (never re-sizes); keep the _R_EPS breakeven guard.",
+        "Do NOT flip EXEC-003 out of shadow until EXEC-008/010 green AND a logged human cutover decision.",
+        "Do NOT edit scalable-brain/ originals."
+      ],
+      "resume_pointer": "ledger event-id 15; CHECKPOINT.md 'intent'"
+    },
+    {
+      "ts_utc": "2026-06-30T14:00:00Z",
+      "agent": "Tier-0 Orchestrator / Execution-Core",
+      "phase_or_task": "EXEC-008",
+      "step": "execution/safety_mode.py: SafetyMonitor state machine RUNNING<->PAUSED on queue staleness (freshness=last order/heartbeat else startup grace; session-aware no-false-pause; hysteresis anti-flap), manual audited BYPASS (bypass_enable + matching confirm token, time-bounded auto-revert, alert+audit hooks), can_submit() gate, conservative_position_size() Kelly-independent. Safety invariant proven: queue down + BYPASS off => can_submit False.",
+      "status": "completed",
+      "intent": "Next: EXEC-009 Layer-5 telemetry/health endpoints (expose consumer lag, safety state, open positions, outbox depth, model_set_id, broker env); then EXEC-010 emergency STOP + graceful lifecycle + reconcile glue wiring OandaAdapter.submit into OutboundConsumer as submit_fn behind SafetyMonitor.can_submit().",
+      "side_effects_in_flight": [],
+      "verify_on_resume": [
+        "cd system-2-execution-engine && PYTHONPATH=src SYSTEM2_ENV_FILE=/nonexistent.env /home/emmanuel/Documents/Scalable_Brain/.venv/bin/python -m pytest src -q -> expect 123 passed.",
+        "Gates: zero monolith imports in safety_mode.py; no hardcoded secrets; invariant test present."
+      ],
+      "files_touched": [
+        "src/system2/execution/safety_mode.py (written)",
+        "src/system2/execution/tests/test_safety_mode.py (written)",
+        "orchestration/PROGRESS_LEDGER.md, CHECKPOINT.md, checkpoint.json (updated)"
+      ],
+      "open_gates_or_blocks": ["AG-EXEC-008 green; EXEC-009 unblocked; OandaAdapter.submit + SafetyMonitor not yet wired into OutboundConsumer poll loop (deferred to EXEC-010)"],
+      "do_not_repeat": [
+        "Do NOT re-decide D-001/D-002/D-003.",
+        "Keep freshness logic (last order/heartbeat, startup grace decays), session-aware no-false-pause, hysteresis.",
+        "Do NOT build a Computer-1-DB BYPASS order source (violates D-001); if needed it must come via queue/GCS with a logged decision.",
+        "Do NOT flip EXEC-003 out of shadow until EXEC-010 green AND a logged human cutover decision.",
+        "Do NOT edit scalable-brain/ originals."
+      ],
+      "resume_pointer": "ledger event-id 17; CHECKPOINT.md 'intent'"
+    },
+    {
+      "ts_utc": "2026-07-01T10:30:00Z",
+      "agent": "Tier-0 Orchestrator / Telemetry",
+      "phase_or_task": "EXEC-009",
+      "step": "telemetry/health.py (HealthReporter: pure, provider-injected, exceptions swallowed -> degrade not crash; health()/account_state()/status()) + telemetry/server.py (FastAPI mount, lazy import, read-only /health /status /api/account/state, binds 127.0.0.1 private). Scoped to System-2-owned state (exec_mode, queue lag, open positions, outbox depth, model_set_id, broker env); AMS account-store endpoints intentionally NOT served (System-3's own Layer 5; would breach D-001 + SYSTEM_BOUNDARY).",
+      "status": "completed",
+      "intent": "Next EXEC-010 (FINAL, spec in MASTER_ORCHESTRATION_PROMPT_v2.md not a task doc): emergency STOP always-reachable, graceful position-safe lifecycle, startup reconcile, runtime glue wiring OandaAdapter.submit->consumer submit_fn, FillProducer.publish_fill->emit_fn, OrderValidator.validate->validate_fn, gated by SafetyMonitor.can_submit(); bind HealthReporter providers to live objects. Then DevOps/packaging.",
+      "side_effects_in_flight": [],
+      "verify_on_resume": [
+        "cd system-2-execution-engine && PYTHONPATH=src SYSTEM2_ENV_FILE=/nonexistent.env /home/emmanuel/Documents/Scalable_Brain/.venv/bin/python -m pytest src -q -> expect 133 passed.",
+        "Gates: no monolith imports in telemetry; no hardcoded secrets; fastapi/uvicorn lazy-imported (not eagerly loaded)."
+      ],
+      "files_touched": [
+        "src/system2/telemetry/health.py, server.py (written)",
+        "src/system2/telemetry/tests/test_health.py (written)",
+        "orchestration/PROGRESS_LEDGER.md, CHECKPOINT.md, checkpoint.json (updated)"
+      ],
+      "open_gates_or_blocks": ["AG-EXEC-009 green; EXEC-010 is the last task and unblocked; runtime glue (submit_fn/emit_fn wiring + STOP + lifecycle) lands in EXEC-010"],
+      "do_not_repeat": [
+        "Do NOT re-decide D-001/D-002/D-003.",
+        "Keep all optional deps lazy (oandapyV20/fastapi/uvicorn/google-cloud-pubsub).",
+        "Telemetry serves only System-2-owned state; do NOT add AMS account-store endpoints here.",
+        "Do NOT flip EXEC-003 out of shadow until EXEC-010 green AND a logged human cutover decision.",
+        "Do NOT edit scalable-brain/ originals."
+      ],
+      "resume_pointer": "ledger event-id 19; CHECKPOINT.md 'intent'"
+    },
+    {
+      "ts_utc": "2026-07-01T11:15:00Z",
+      "agent": "Tier-0 Orchestrator / Execution-Core",
+      "phase_or_task": "EXEC-010 (FINAL) - BUILD DAG COMPLETE",
+      "step": "execution/lifecycle.py: EmergencyStop (signal/trigger/filesystem-sentinel, always reachable) + ExecutionRuntime (tick loop evaluate-safety -> consume gated by submit_gate_fn=can_submit [PAUSED parks new orders] -> manage positions always; startup_reconcile adopts broker open trades; graceful shutdown flushes outbox + emits STOPPED + leaves positions with broker stops [flatten opt-in]; idempotent) + build_from_secrets composition root (submit_fn=OandaAdapter.submit, emit_fn=FillProducer.publish_fill, validate_fn=OrderValidator.validate, HealthReporter->live; EXEC_SHADOW default true). Added additive submit_gate_fn to OutboundConsumer.",
+      "status": "completed",
+      "intent": "BUILD DAG COMPLETE (10/10). Next: DevOps/packaging (requirements.txt prune, RUNBOOK.md, docs/SCHEMA_ADDITIONS.md + migrations/, common/db.py, __main__ entrypoint) then practice integration drill + LOGGED human cutover decision to flip EXEC-003 out of SHADOW.",
+      "side_effects_in_flight": [],
+      "verify_on_resume": [
+        "cd system-2-execution-engine && PYTHONPATH=src SYSTEM2_ENV_FILE=/nonexistent.env /home/emmanuel/Documents/Scalable_Brain/.venv/bin/python -m pytest src -q -> expect 144 passed.",
+        "Service-wide gates: zero monolith imports; no hardcoded secrets; oandapyV20/fastapi/uvicorn/pubsub all lazy; build_from_secrets fail-closes on missing creds."
+      ],
+      "files_touched": [
+        "src/system2/execution/lifecycle.py (written)",
+        "src/system2/execution/outbound_consumer.py (additive submit_gate_fn)",
+        "src/system2/execution/tests/test_lifecycle.py (written)",
+        "orchestration/PROGRESS_LEDGER.md, CHECKPOINT.md, checkpoint.json (updated)"
+      ],
+      "open_gates_or_blocks": ["Build DAG done; remaining = DevOps/packaging + LOGGED human cutover decision; live trading blocked until that decision is logged"],
+      "do_not_repeat": [
+        "Do NOT re-decide D-001/D-002/D-003.",
+        "Keep all optional deps lazy; adapter never re-sizes units; telemetry serves only System-2 state.",
+        "Emergency STOP + graceful-shutdown-leaves-broker-stops is intentional (no orphaned risk) - keep.",
+        "Do NOT flip EXEC-003 out of SHADOW until practice drill passes AND a human cutover decision is logged in DECISIONS_LOG.md.",
+        "Do NOT edit scalable-brain/ originals."
+      ],
+      "resume_pointer": "ledger event-id 21; CHECKPOINT.md 'intent'"
+    },
+    {
+      "ts_utc": "2026-07-01T12:35:00Z",
+      "agent": "Tier-0 Orchestrator / DevOps",
+      "phase_or_task": "DevOps/packaging (post EXEC-010)",
+      "step": "requirements.txt + requirements-dev.txt (pruned/pinned, heavy deps lazy); src/system2/__main__.py entrypoint (build_from_secrets -> health thread -> run loop; fail-closed exit 2, verified); docs/SCHEMA_ADDITIONS.md + migrations/{sqlite,postgres}/001_fact_live_trades_additions.sql (EXEC-006 columns); src/system2/common/db.py (D-001 local datastore: DbConfig sqlite|postgres fail-closed, idempotent migration runner + `python -m system2.common.db migrate` CLI); RUNBOOK.md; logged D-004 (shadow->live cutover) as PENDING human decision.",
+      "status": "completed",
+      "intent": "System 2 transfer-ready (code+packaging). Remaining is human/ops: provision config/.env.system2 -> `python -m system2.common.db migrate` -> practice integration drill -> LOG D-004 APPROVED -> set EXEC_SHADOW=false / OANDA_ENV=live. Optional: Dockerfile, systemd unit, wire persist_fn->Fact_Live_Trades via common/db.py.",
+      "side_effects_in_flight": [],
+      "verify_on_resume": [
+        "cd system-2-execution-engine && PYTHONPATH=src SYSTEM2_ENV_FILE=/nonexistent.env /home/emmanuel/Documents/Scalable_Brain/.venv/bin/python -m pytest src -q -> expect 148 passed.",
+        "python -m system2 with no creds -> exit 2 (fail-closed); python -m system2.common.db migrate (sqlite) applies 001.",
+        "DECISIONS_LOG.md D-004 must be APPROVED (human) before any live order."
+      ],
+      "files_touched": [
+        "requirements.txt, requirements-dev.txt (written)",
+        "src/system2/__main__.py, src/system2/common/db.py (written)",
+        "docs/SCHEMA_ADDITIONS.md, migrations/sqlite/001_*.sql, migrations/postgres/001_*.sql (written)",
+        "RUNBOOK.md (written)",
+        "src/system2/common/tests/test_db.py (written)",
+        "orchestration/PROGRESS_LEDGER.md, CHECKPOINT.md, checkpoint.json, DECISIONS_LOG.md (updated)"
+      ],
+      "open_gates_or_blocks": ["Live trading blocked on D-004 (human, mandatory) after a passing practice drill; all engineering for a transfer-ready practice service is complete"],
+      "do_not_repeat": [
+        "Do NOT re-decide D-001/D-002/D-003.",
+        "Keep all optional deps lazy; adapter never re-sizes units; telemetry serves only System-2 state.",
+        "Do NOT flip EXEC-003 out of SHADOW / enable live until D-004 is LOGGED APPROVED after a passing practice drill.",
+        "Do NOT build a Computer-1-DB BYPASS order source (violates D-001).",
+        "Do NOT edit scalable-brain/ originals."
+      ],
+      "resume_pointer": "ledger event-id 23; CHECKPOINT.md 'intent'"
+    },
+    {
+      "ts_utc": "2026-07-01T13:00:00Z",
+      "agent": "Tier-0 Orchestrator / DevOps",
+      "phase_or_task": "Optional polish (persist_fn wiring + container/systemd)",
+      "step": "execution/trade_recorder.py (schema-aware, parameterized, upsert Fact_Live_Trades; wired as pipeline persist_fn in build_from_secrets -> persist-then-publish; log-and-continue on DB error). Dockerfile + .dockerignore (non-root, practice/SHADOW default, secrets at runtime). deploy/system2.service (systemd: ExecStartPre migrate, SIGTERM graceful 60s, fail-closed restart limits, FS hardening).",
+      "status": "completed",
+      "intent": "ALL engineering complete (152/152 tests). Only human/ops remain: provision config/.env.system2 -> python -m system2.common.db migrate -> practice integration drill -> LOG D-004 APPROVED -> set EXEC_SHADOW=false / OANDA_ENV=live.",
+      "side_effects_in_flight": [],
+      "verify_on_resume": [
+        "cd system-2-execution-engine && PYTHONPATH=src SYSTEM2_ENV_FILE=/nonexistent.env /home/emmanuel/Documents/Scalable_Brain/.venv/bin/python -m pytest src -q -> expect 152 passed.",
+        "build_from_secrets still fail-closes on missing OANDA creds (persist wiring runs after the adapter secret check).",
+        "DECISIONS_LOG.md D-004 must be APPROVED (human) before any live order."
+      ],
+      "files_touched": [
+        "src/system2/execution/trade_recorder.py (written)",
+        "src/system2/execution/lifecycle.py (persist_fn wired in build_from_secrets)",
+        "src/system2/execution/tests/test_trade_recorder.py (written)",
+        "Dockerfile, .dockerignore, deploy/system2.service (written)",
+        "orchestration/PROGRESS_LEDGER.md, CHECKPOINT.md, checkpoint.json (updated)"
+      ],
+      "open_gates_or_blocks": ["Live trading blocked on D-004 (human, mandatory) after a passing practice drill; ALL engineering complete"],
+      "do_not_repeat": [
+        "Do NOT re-decide D-001/D-002/D-003.",
+        "persist_fn is best-effort (log-and-continue) so a DB hiccup never blocks fill delivery via the outbox - keep.",
+        "Keep all optional deps lazy; adapter never re-sizes units; telemetry serves only System-2 state.",
+        "Do NOT flip EXEC-003 out of SHADOW / enable live until D-004 is LOGGED APPROVED after a passing practice drill.",
+        "Do NOT edit scalable-brain/ originals."
+      ],
+      "resume_pointer": "ledger event-id 24; CHECKPOINT.md 'intent'"
+    }
+  ]
+}

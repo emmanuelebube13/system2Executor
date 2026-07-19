@@ -1,0 +1,42 @@
+{
+  "schema_version": "1",
+  "program": "System 2 — Execution Engine (The Hand)",
+  "updated_at_utc": "2026-06-30T11:10:00Z",
+  "current_phase": "Build — DAG execution",
+  "next_action": "EXEC-004 (outbound queue consumer + last-line validation + DLQ) and EXEC-005 (fill producer). Build common/queue_backend.py (D-002 Pub/Sub + local durable) first; these wire the slim pipeline's submit_fn/emit_fn. Then EXEC-008 (staleness PAUSE) + EXEC-010 (emergency STOP) before any live cutover.",
+  "execution_mode": "single-threaded (orchestrator performs each role inline)",
+  "decisions": {
+    "D-001_connectivity": "Local datastore on Computer 2 (default local PostgreSQL; SQLite for dev)",
+    "D-002_queue_backend": "Google Cloud Pub/Sub (local durable for dev/test)",
+    "D-003_phase0_signoff": "APPROVED 2026-06-29 (AG-EXEC-000 green)"
+  },
+  "tasks": {
+    "PHASE-0": {"status": "done", "gate": "AG-EXEC-000", "next_action": "—"},
+    "EXEC-001": {"status": "done", "owner": "Artifact-Sync", "gate": "AG-EXEC-001 GREEN", "next_action": "—", "artifacts": ["common/logging.py", "common/secrets.py", "common/storage_backend.py", "artifact_sync/downloader.py", "tests 11/11 pass"]},
+    "EXEC-002": {"status": "done", "owner": "Artifact-Sync", "gate": "AG-EXEC-002 GREEN", "depends_on": ["EXEC-001"], "artifacts": ["artifact_sync/features.py", "regime_mapping.py", "live_regime.py", "candles.py", "tests 9/9 pass"]},
+    "EXEC-003": {"status": "done", "owner": "Execution-Core", "gate": "AG-EXEC-003 GREEN", "artifacts": ["execution/pipeline.py", "tests/golden/exec003_orders.json", "tests 14/14 pass"], "note": "live submission still in shadow; flip to live only after EXEC-004/006/008/010 green"},
+    "EXEC-004": {"status": "todo", "owner": "Execution-Core", "gate": "AG-EXEC-004", "depends_on": ["EXEC-003"]},
+    "EXEC-005": {"status": "todo", "owner": "Execution-Core", "gate": "AG-EXEC-005", "depends_on": ["EXEC-003"]},
+    "EXEC-006": {"status": "todo", "owner": "Broker", "gate": "AG-EXEC-006", "depends_on": ["EXEC-003"]},
+    "EXEC-007": {"status": "todo", "owner": "Broker", "gate": "AG-EXEC-007", "depends_on": ["EXEC-006"]},
+    "EXEC-008": {"status": "todo", "owner": "Execution-Core", "gate": "AG-EXEC-008", "depends_on": ["EXEC-004"]},
+    "EXEC-009": {"status": "todo", "owner": "Telemetry", "gate": "AG-EXEC-009", "depends_on": ["EXEC-005"]},
+    "EXEC-010": {"status": "todo", "owner": "Execution-Core", "gate": "AG-EXEC-010", "depends_on": ["EXEC-004"], "note": "emergency STOP + graceful lifecycle + reconcile glue + DLQ wiring"}
+  },
+  "event_log": [
+    {"id": 1, "ts_utc": "2026-06-29T20:46:00Z", "event": "Session start; confirmed build target empty (only orchestration prompts), all monolith sources + specs + skills present."},
+    {"id": 2, "ts_utc": "2026-06-29T20:47:00Z", "event": "Read System-2 README + dependencies spec to ground architecture."},
+    {"id": 3, "ts_utc": "2026-06-29T20:48:00Z", "event": "HUMAN DECISIONS captured: D-001 = Local datastore on Computer 2; D-002 = Google Cloud Pub/Sub."},
+    {"id": 4, "ts_utc": "2026-06-29T20:49:00Z", "event": "Created folder skeleton; copied EXEC specs + README + 8 skills into docs/ for self-containment."},
+    {"id": 5, "ts_utc": "2026-06-29T20:50:00Z", "event": "Wrote Phase-0 artifacts: SYSTEM_BOUNDARY.md, STORAGE_AND_QUEUE_ABSTRACTION.md, FILE_MIGRATION_MANIFEST.md, ARCHITECTURE.md, config/.env.system2.template, .gitignore, orchestration scaffolding (DECISIONS_LOG, FOLDER_STRUCTURE, AGENT_FLEET_TOPOLOGY, ledger, checkpoint, continuation)."},
+    {"id": 6, "ts_utc": "2026-06-29T20:50:00Z", "event": "STOP: awaiting human Phase-0 sign-off (D-003) before any EXEC build task."},
+    {"id": 7, "ts_utc": "2026-06-29T21:00:00Z", "event": "HUMAN: Phase-0 approved. D-003 logged; AG-EXEC-000 green (7/7). Build unblocked."},
+    {"id": 8, "ts_utc": "2026-06-30T10:00:00Z", "event": "Built common infra: logging.py (JSON+correlation_id+secret masking), secrets.py (fail-closed dotenv loader), storage_backend.py (StorageBackend Protocol + GCSBackend + LocalFSBackend + sha256)."},
+    {"id": 9, "ts_utc": "2026-06-30T10:03:00Z", "event": "EXEC-001 downloader.py: poll latest.json -> SHA256 verify -> atomic symlink swap -> last_good retention + rollback. 11/11 unit tests pass; secret-masking + fail-closed smoke OK."},
+    {"id": 10, "ts_utc": "2026-06-30T10:05:00Z", "event": "AG-EXEC-001 GREEN. EXEC-001 done. DONE + audit markers written."},
+    {"id": 11, "ts_utc": "2026-06-30T10:35:00Z", "event": "EXEC-002 built: features.py + regime_mapping.py (self-contained copies of monolith for inference parity), live_regime.py (LiveRegimeDetector + OnlineDebouncer + last_good fallback), candles.py (OandaCandleSource, lazy SDK). Inference = scaler.transform(X)*weights -> predict_proba."},
+    {"id": 12, "ts_utc": "2026-06-30T10:40:00Z", "event": "AG-EXEC-002 GREEN. 9/9 EXEC-002 tests; full suite 20/20. Artifact-Sync cluster (EXEC-001+002) complete."},
+    {"id": 13, "ts_utc": "2026-06-30T11:05:00Z", "event": "EXEC-003 built: execution/pipeline.py slim execution-only path. Preserved ATR determinism (SL∓1.0*ATR, TP±3.0*ATR, RR3.0) verbatim from monolith; ApprovedOrder input contract; units never re-sized; BackupCorrelationGuard backstop; session guard; idempotency dedup; EXEC_MODE legacy|execution_only + shadow. Golden file pins exact float outputs."},
+    {"id": 14, "ts_utc": "2026-06-30T11:10:00Z", "event": "AG-EXEC-003 GREEN. 14/14 EXEC-003 tests incl golden-file determinism + dual-run vs legacy formula; full suite 34/34. Live submission stays SHADOW until EXEC-004/006/008/010 green."}
+  ]
+}

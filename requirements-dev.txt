@@ -1,0 +1,5 @@
+# System 2 — dev/test dependencies (on top of requirements.txt).
+-r requirements.txt
+
+pytest==9.0.2
+httpx==0.28.1          # starlette TestClient transport (EXEC-009 endpoint tests)

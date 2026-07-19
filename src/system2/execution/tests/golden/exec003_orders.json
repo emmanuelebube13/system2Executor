@@ -1,0 +1,38 @@
+[
+  {
+    "idempotency_key": "k-buy-eurusd",
+    "correlation_id": "c1",
+    "instrument": "EUR_USD",
+    "side": "BUY",
+    "units": 10000,
+    "entry_price": 1.1,
+    "stop_loss": 1.0990000000000002,
+    "take_profit": 1.103,
+    "atr_value": 0.001,
+    "rr_ratio": 3.0
+  },
+  {
+    "idempotency_key": "k-sell-gbpusd",
+    "correlation_id": "c2",
+    "instrument": "GBP_USD",
+    "side": "SELL",
+    "units": -5000,
+    "entry_price": 1.25,
+    "stop_loss": 1.252,
+    "take_profit": 1.244,
+    "atr_value": 0.002,
+    "rr_ratio": 3.0
+  },
+  {
+    "idempotency_key": "k-buy-usdjpy",
+    "correlation_id": "c3",
+    "instrument": "USD_JPY",
+    "side": "BUY",
+    "units": 3000,
+    "entry_price": 156.3,
+    "stop_loss": 156.0,
+    "take_profit": 156.9,
+    "atr_value": 0.05,
+    "rr_ratio": 3.0
+  }
+]
