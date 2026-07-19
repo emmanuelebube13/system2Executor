@@ -1,0 +1,35 @@
+# --- Secrets (NEVER commit) ---
+config/.env.system2
+config/.env.system2.*
+!config/.env.system2.template
+*.env
+*service-account*.json
+*credentials*.json
+config/gcp-sa.json
+gcp-sa*.json
+
+# --- Runtime state (local to Computer 2) ---
+state/
+logs/
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+venv314/
+venv*/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+suite.xml
+junit*.xml
+
+# --- Node / frontend (telemetry) ---
+node_modules/
+dist/
+.vite/
+
+# --- OS ---
+.DS_Store

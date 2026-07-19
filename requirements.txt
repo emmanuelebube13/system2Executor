@@ -1,0 +1,28 @@
+# System 2 — Execution Engine ("The Hand") — runtime dependencies
+# Python 3.12. Pins mirror the validated dev venv; version-bump deliberately, not by drift.
+# Every heavy dep is imported LAZILY in code, so a partial install still runs the parts that
+# don't need it (e.g. dev with QUEUE_PROVIDER=local + STORAGE_PROVIDER=local needs none of the
+# cloud/broker SDKs). Groups below map to the EXEC clusters.
+
+# --- Broker adapter (EXEC-006/007) — OANDA v20 REST, lazy import ---
+oandapyV20==0.7.2
+
+# --- Cross-system transport (D-002; EXEC-004/005) — Google Cloud Pub/Sub, lazy import ---
+# Not needed when QUEUE_PROVIDER=local (SQLite durable backend, dev/test).
+google-cloud-pubsub>=2.21,<3
+
+# --- Model artifacts (EXEC-001) — GCS object storage, lazy import ---
+# Not needed when STORAGE_PROVIDER=local (LocalFS backend, dev/test).
+google-cloud-storage==3.12.0
+
+# --- Live regime inference (EXEC-002) ---
+pandas==2.3.3
+numpy==2.4.4
+scikit-learn==1.8.0
+hmmlearn==0.3.3
+joblib==1.5.3
+
+# --- Health / telemetry surface (EXEC-009) — FastAPI, lazy import ---
+# Not needed if the health server is not started.
+fastapi==0.135.3
+uvicorn==0.43.0

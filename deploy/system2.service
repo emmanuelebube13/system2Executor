@@ -1,0 +1,37 @@
+# systemd unit for System 2 — Execution Engine (Computer 2, bare-metal/VM install).
+# Install: copy to /etc/systemd/system/system2.service, edit paths/User, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now system2
+# Graceful stop (SIGTERM -> EXEC-010 graceful, position-safe shutdown): sudo systemctl stop system2
+# Emergency STOP without systemd: touch <WorkingDirectory>/state/control/STOP
+[Unit]
+Description=System 2 - Execution Engine (The Hand)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hand
+Group=hand
+WorkingDirectory=/opt/system-2-execution-engine
+Environment=PYTHONPATH=/opt/system-2-execution-engine/src
+EnvironmentFile=/opt/system-2-execution-engine/config/.env.system2
+# Apply pending migrations first (idempotent), then run the engine.
+ExecStartPre=/opt/system-2-execution-engine/.venv/bin/python -m system2.common.db migrate
+ExecStart=/opt/system-2-execution-engine/.venv/bin/python -m system2
+# Give EXEC-010 time to flush the outbox + emit STOPPED before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+# Startup is fail-closed (exit 2 on missing secret); don't thrash-restart a misconfig.
+StartLimitIntervalSec=120
+StartLimitBurst=3
+# Hardening (read-only FS except the writable state/logs dirs).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/system-2-execution-engine/state /opt/system-2-execution-engine/logs
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+.venv/
+**/__pycache__/
+**/*.pyc
+.git/
+logs/
+state/
+config/.env.system2
+config/.env.system2.*
+!config/.env.system2.template
+*.db
+.pytest_cache/
