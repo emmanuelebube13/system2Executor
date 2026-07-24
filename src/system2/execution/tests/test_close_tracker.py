@@ -19,15 +19,20 @@ import pytest
 from system2.broker.position_manager import ManagedTrade, PositionManager
 from system2.common.queue_backend import LocalDurableBackend
 from system2.execution.close_tracker import (
+    VALID_EXIT_REASONS,
     CloseEmitter,
     CloseSweeper,
     build_close_event,
     build_managed_trade,
     exit_reason_from_trade_details,
+    exit_reason_from_transaction,
     facts_from_close_response,
     facts_from_trade_details,
+    facts_from_transaction,
+    find_close_transaction,
     managed_trade_from_broker_trade,
     managed_trade_from_fill,
+    resolve_close_from_transactions,
 )
 from system2.execution.fill_producer import FillProducer, FillResult, build_outbox
 from system2.execution.lifecycle import EmergencyStop, ExecutionRuntime
@@ -77,12 +82,18 @@ class FakeInbound:
 
 
 class FakeTransport:
-    """OandaTransport stub: get_open_trades / get_trade with call counting."""
+    """OandaTransport stub: get_open_trades / get_trade / transaction stream, with counts."""
 
-    def __init__(self, open_trades=None, trade_details=None) -> None:
+    def __init__(self, open_trades=None, trade_details=None, transactions=None,
+                 last_txn_id=None, trade_error=None) -> None:
         self._open = list(open_trades or [])
         self._details = dict(trade_details or {})
+        self._transactions = list(transactions or [])
+        self._last_txn_id = last_txn_id
+        self.trade_error = trade_error  # exception to raise from get_trade (e.g. NO_SUCH_TRADE)
         self.open_trades_calls = 0
+        self.get_trade_calls = 0
+        self.idrange_calls = 0
         self.fail_open_trades = False
 
     def get_open_trades(self):
@@ -92,7 +103,25 @@ class FakeTransport:
         return self._open
 
     def get_trade(self, trade_id):
+        self.get_trade_calls += 1
+        if self.trade_error is not None:
+            raise self.trade_error
         return self._details.get(str(trade_id))
+
+    def get_account_summary(self):
+        return {"lastTransactionID": str(self._last_txn_id)} if self._last_txn_id else {}
+
+    def get_transactions_idrange(self, from_id, to_id):
+        self.idrange_calls += 1
+        out = []
+        for txn in self._transactions:
+            try:
+                tid = int(txn.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if from_id <= tid <= to_id:
+                out.append(txn)
+        return out
 
 
 class ClosingAdapter:
@@ -804,6 +833,256 @@ def test_exit_slippage_malformed_price_fails_open():
     details = _closed_trade_details(
         stopLossOrder={"id": "1", "state": "FILLED", "price": "not-a-price"})
     assert facts_from_trade_details(details).slippage_pips is None
+
+
+# --------------------------------------------------------------------------- #
+# 9) Transaction-stream fallback — the 2026-07-21 NO_SUCH_TRADE incident
+#
+# OANDA 404'd /trades/2580 for a trade it had just opened and stopped out (absent from
+# /trades in EVERY state), while the transaction stream carried the full close. Payloads
+# below are the REAL ones pulled from account 101-002-38449021-001.
+# --------------------------------------------------------------------------- #
+class NoSuchTrade(Exception):
+    """Mirrors the V20Error the transport raises for a 404 NO_SUCH_TRADE."""
+
+
+NO_SUCH_TRADE_ERR = NoSuchTrade(
+    '{"lastTransactionID":"2584","errorMessage":"The trade ID specified does not exist",'
+    '"errorCode":"NO_SUCH_TRADE"}')
+
+
+def _txn_2580_stream() -> list[dict]:
+    """Transactions 2579-2584 exactly as OANDA returned them for the incident trade."""
+    return [
+        {"id": "2579", "type": "MARKET_ORDER", "instrument": "EUR_USD", "units": "116992",
+         "reason": "CLIENT_ORDER", "time": "2026-07-21T15:41:24.086239000Z"},
+        {"id": "2580", "type": "ORDER_FILL", "instrument": "EUR_USD", "units": "116992",
+         "price": "1.14085", "reason": "MARKET_ORDER", "orderID": "2579", "pl": "0.0000",
+         "accountBalance": "84234.7938", "time": "2026-07-21T15:41:24.086239000Z",
+         "clientOrderID": "sb-2a3670bc-1122-4f58-bf9e-dd647f1b3815",
+         "tradeOpened": {"tradeID": "2580", "units": "116992", "price": "1.14085"}},
+        {"id": "2581", "type": "TAKE_PROFIT_ORDER", "price": "1.14445", "reason": "ON_FILL",
+         "tradeID": "2580", "time": "2026-07-21T15:41:24.086239000Z"},
+        {"id": "2582", "type": "STOP_LOSS_ORDER", "price": "1.13965", "reason": "ON_FILL",
+         "tradeID": "2580", "time": "2026-07-21T15:41:24.086239000Z"},
+        {"id": "2583", "type": "ORDER_FILL", "instrument": "EUR_USD", "units": "-116992",
+         "price": "1.13964", "reason": "STOP_LOSS_ORDER", "orderID": "2582",
+         "pl": "-201.7304", "accountBalance": "84033.0634",
+         "time": "2026-07-21T20:57:50.123456789Z",
+         "tradesClosed": [{"tradeID": "2580",
+                           "clientTradeID": "sb-2a3670bc-1122-4f58-bf9e-dd647f1b3815",
+                           "units": "-116992", "price": "1.13964",
+                           "realizedPL": "-201.7304"}]},
+        {"id": "2584", "type": "ORDER_CANCEL", "reason": "LINKED_TRADE_CLOSED",
+         "orderID": "2581", "time": "2026-07-21T20:57:50.123456789Z"},
+    ]
+
+
+def _trade_2580() -> ManagedTrade:
+    return build_managed_trade(
+        broker_trade_id="2580", instrument="EUR_USD", side="BUY", entry_price=1.14085,
+        initial_stop_price=1.13965, take_profit_price=1.14445,
+        open_time="2026-07-21T15:41:24.086239000Z", granularity="H1",
+        correlation_id="cfd5c544-e320-4d18-a1aa-0d62a55ee2c7",
+        order_request_id="2a3670bc-1122-4f58-bf9e-dd647f1b3815")
+
+
+def _txn_transport(**over) -> FakeTransport:
+    base = dict(open_trades=[], trade_details={}, transactions=_txn_2580_stream(),
+                last_txn_id=2584, trade_error=NO_SUCH_TRADE_ERR)
+    base.update(over)
+    return FakeTransport(**base)
+
+
+def test_find_close_transaction_locates_the_closing_fill():
+    located = find_close_transaction(_txn_transport(), "2580")
+    assert located is not None
+    txn, closed, index = located
+    assert txn["id"] == "2583" and txn["reason"] == "STOP_LOSS_ORDER"
+    assert closed["realizedPL"] == "-201.7304"
+    assert "2582" in index  # the SL order txn is indexed for the slippage lookup
+
+
+def test_facts_from_transaction_matches_the_broker_numbers():
+    txn, closed, index = find_close_transaction(_txn_transport(), "2580")
+    facts = facts_from_transaction(txn, closed, instrument="EUR_USD", txn_by_id=index)
+    assert facts.close_txn_id == "2583"          # close txn id — the S3 dedup key
+    assert facts.realized_pnl == pytest.approx(-201.7304)
+    assert facts.close_price == pytest.approx(1.13964)
+    assert facts.units == pytest.approx(116992)  # magnitude; sign comes from the trade
+    assert facts.close_time == "2026-07-21T20:57:50.123456789Z"
+    # EXEC-013: SL order 2582 was at 1.13965, filled 1.13964 -> -0.1 pip
+    assert facts.slippage_pips == pytest.approx(-0.1)
+    assert exit_reason_from_transaction(txn) == "sl"
+
+
+def test_transaction_exit_reason_mapping():
+    assert exit_reason_from_transaction({"reason": "TAKE_PROFIT_ORDER"}) == "tp"
+    assert exit_reason_from_transaction({"reason": "STOP_LOSS_ORDER"}) == "sl"
+    assert exit_reason_from_transaction({"reason": "TRAILING_STOP_LOSS_ORDER"}) == "sl"
+    assert exit_reason_from_transaction({"reason": "MARKET_ORDER_TRADE_CLOSE"}) == "manual"
+    assert exit_reason_from_transaction({"reason": "MARKET_ORDER_MARGIN_CLOSEOUT"}) == "flatten"
+    assert exit_reason_from_transaction({"reason": "SOMETHING_NEW"}) == "other"
+    for reason in ("STOP_LOSS_ORDER", "MARKET_ORDER_TRADE_CLOSE", "SOMETHING_NEW"):
+        assert exit_reason_from_transaction({"reason": reason}) in VALID_EXIT_REASONS
+
+
+def test_manual_close_via_transactions_has_no_slippage():
+    """A market close carries no expected price, so slippage must stay absent."""
+    stream = _txn_2580_stream()
+    stream[4] = dict(stream[4], reason="MARKET_ORDER_TRADE_CLOSE", orderID="9999")
+    txn, closed, index = find_close_transaction(_txn_transport(transactions=stream), "2580")
+    facts = facts_from_transaction(txn, closed, instrument="EUR_USD", txn_by_id=index)
+    assert facts.slippage_pips is None
+    assert "slippage_pips" not in build_close_event(_trade_2580(), facts, "manual")
+
+
+def test_sweep_recovers_close_when_get_trade_404s(tmp_path):
+    """THE regression test: /trades 404s, the close still reaches System 3."""
+    rig = _sweep_rig(tmp_path, trade=_trade_2580())
+    rig["sweeper"].transport = _txn_transport()
+
+    result = rig["sweeper"].sweep()
+
+    assert result["closed"] == 1 and result["via_transactions"] == 1
+    events = rig["queue"].events()
+    assert len(events) == 1
+    event = events[0]
+    assert set(event) <= ALLOWED_EVENT_FIELDS          # S3 rejects unknown fields
+    assert event["status"] == "closed"
+    assert event["broker_order_id"] == "2583"          # the close txn id
+    assert event["order_request_id"] == "2a3670bc-1122-4f58-bf9e-dd647f1b3815"
+    assert event["signal_id"] == "cfd5c544-e320-4d18-a1aa-0d62a55ee2c7"
+    assert event["exit_reason"] == "sl"
+    assert event["realized_pnl"] == pytest.approx(-201.7304)
+    assert event["units"] == 116992                    # long -> positive
+    assert event["pair"] == "EUR_USD"
+    assert rig["trade"].closed is True
+
+
+def test_fallback_not_used_when_get_trade_works(tmp_path):
+    """Cheap path stays the default: no transaction scan when /trades answers."""
+    rig = _sweep_rig(tmp_path)
+    rig["sweeper"].sweep()
+    assert rig["transport"].idrange_calls == 0
+    assert rig["queue"].events()[0]["broker_order_id"] == "2560"  # from closingTransactionIDs
+
+
+def test_open_trade_never_triggers_a_transaction_scan(tmp_path):
+    """A trade the broker still reports OPEN is open-list lag, not a missing close."""
+    rig = _sweep_rig(tmp_path, details=_closed_trade_details(state="OPEN"))
+    transport = _txn_transport(trade_details={"2518": _closed_trade_details(state="OPEN")},
+                              trade_error=None)
+    rig["sweeper"].transport = transport
+    assert rig["sweeper"].sweep()["closed"] == 0
+    assert transport.idrange_calls == 0
+    assert rig["queue"].events() == []
+
+
+def test_transaction_fallback_is_backed_off_per_trade(tmp_path):
+    """An unresolvable trade must not rescan the stream every 30s forever."""
+    rig = _sweep_rig(tmp_path, trade=_trade_2580())
+    transport = _txn_transport(transactions=[])  # nothing to find -> stays unresolved
+    rig["sweeper"].transport = transport
+    clk = rig["clk"]
+
+    rig["sweeper"].sweep()
+    assert transport.idrange_calls == 1    # first miss scans the stream once
+    first_get_trade = transport.get_trade_calls
+
+    clk[0] = T0 + timedelta(seconds=31)    # past the sweep throttle, inside the fallback backoff
+    rig["sweeper"].sweep()
+    assert transport.get_trade_calls > first_get_trade  # the sweep itself still runs
+    assert transport.idrange_calls == 1                 # ...but the stream is NOT rescanned
+
+    clk[0] = T0 + timedelta(seconds=400)   # past the 300s fallback backoff
+    rig["sweeper"].sweep()
+    assert transport.idrange_calls == 2                 # one retry, not thirteen
+    assert rig["queue"].events() == []      # still unresolved, still no phantom close
+
+
+def test_fallback_and_trade_details_produce_the_same_dedup_key(tmp_path):
+    """Both sources must yield the same close txn id, or a close could double-book."""
+    details = _closed_trade_details(
+        id="2580", instrument="EUR_USD", initialUnits="116992",
+        closingTransactionIDs=["2583"], realizedPL="-201.7304",
+        averageClosePrice="1.13964", closeTime="2026-07-21T20:57:50.123456789Z",
+        stopLossOrder={"id": "2582", "state": "FILLED", "price": "1.13965"},
+        takeProfitOrder={"id": "2581", "state": "CANCELLED", "price": "1.14445"})
+    from_details = facts_from_trade_details(details)
+    txn, closed, index = find_close_transaction(_txn_transport(), "2580")
+    from_txn = facts_from_transaction(txn, closed, instrument="EUR_USD", txn_by_id=index)
+
+    assert from_details.close_txn_id == from_txn.close_txn_id == "2583"
+    assert from_details.realized_pnl == pytest.approx(from_txn.realized_pnl)
+    assert from_details.close_price == pytest.approx(from_txn.close_price)
+    assert from_details.slippage_pips == pytest.approx(from_txn.slippage_pips)
+
+
+def test_backfill_recovers_the_close_when_get_trade_404s(tmp_path, monkeypatch, capsys):
+    """The documented recovery path must work for the very failure it exists to repair."""
+    import system2.broker.oanda_transport as transport_mod
+    import system2.common.secrets as secrets_mod
+
+    outbox_path = tmp_path / "fill_outbox.db"
+    producer = FillProducer(FakeQueue(), "ams-inbound", build_outbox(outbox_path))
+    producer.publish_fill(
+        _approved_order(idempotency_key="2a3670bc-1122-4f58-bf9e-dd647f1b3815",
+                        correlation_id="cfd5c544-e320-4d18-a1aa-0d62a55ee2c7",
+                        instrument="EUR_USD", side="BUY", units=116992),
+        _fill(broker_trade_id="2580", broker_order_id="2579", fill_price=1.14085,
+              stop_loss_price=1.13965, take_profit_price=1.14445))
+
+    queue_path = tmp_path / "queue.db"
+    ledger_path = tmp_path / "close_sweep.db"
+    secrets = FakeSecrets({
+        "QUEUE_PROVIDER": "local", "QUEUE_LOCAL_PATH": str(queue_path),
+        "FILL_OUTBOX_PATH": str(outbox_path), "CLOSE_LEDGER_PATH": str(ledger_path),
+        "S3_CLOSE_TOPIC": S3_TOPIC,
+    })
+    monkeypatch.setattr(secrets_mod, "get_secrets", lambda: secrets)
+    monkeypatch.setattr(transport_mod, "build_transport", lambda s: _txn_transport())
+
+    tool = _load_backfill_tool()
+    assert tool.main(["--since", "2026-07-21T00:00:00Z"]) == 0
+
+    out = capsys.readouterr().out
+    assert "[fallback]" in out and "transaction stream" in out
+    assert "via=transactions" in out
+    msgs = LocalDurableBackend(queue_path).pull(S3_TOPIC, max_messages=10)
+    assert len(msgs) == 1
+    event = msgs[0].body
+    assert set(event) <= ALLOWED_EVENT_FIELDS
+    assert event["broker_order_id"] == "2583"
+    assert event["exit_reason"] == "sl"
+    assert event["realized_pnl"] == pytest.approx(-201.7304)
+    assert SqliteProcessedStore(ledger_path).seen("2580")   # rerunning is now a no-op
+
+
+def test_transaction_path_close_event_passes_s3_production_validator():
+    """The fallback's event crosses the same contract boundary as the normal path."""
+    contracts = _s3_contracts()
+    if contracts is None:
+        pytest.skip(f"S3 repo not available at {S3_SRC}")
+    txn, closed, index = find_close_transaction(_txn_transport(), "2580")
+    facts = facts_from_transaction(txn, closed, instrument="EUR_USD", txn_by_id=index)
+    event = build_close_event(_trade_2580(), facts, exit_reason_from_transaction(txn))
+    contracts.validate_and_check_fresh("FillEvent", event)
+    assert "broker_order_id" in event and "payload" not in event
+
+
+def test_resolve_close_from_transactions_fails_open_on_broker_error():
+    class Boom(FakeTransport):
+        def get_transactions_idrange(self, from_id, to_id):
+            raise ConnectionError("OANDA 503")
+
+    assert resolve_close_from_transactions(
+        Boom(last_txn_id=2584), "2580", instrument="EUR_USD") is None
+
+
+def test_non_numeric_trade_id_skips_the_scan_cleanly():
+    """Fake/other-broker ids have no transaction range — must not explode."""
+    assert find_close_transaction(_txn_transport(), "T1") is None
 
 
 def test_close_event_with_slippage_passes_s3_validator():
