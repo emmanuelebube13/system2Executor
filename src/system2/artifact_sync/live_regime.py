@@ -177,8 +177,13 @@ class LiveRegimeDetector:
         return False
 
     # ----- prediction ------------------------------------------------------------
-    def _feature_vector(self, candles: pd.DataFrame) -> tuple[np.ndarray, str] | None:
-        """Build the last-bar feature vector per the bundle's feature contract."""
+    def _feature_matrix(self, candles: pd.DataFrame) -> tuple[np.ndarray, str] | None:
+        """Build the feature matrix (oldest->newest) per the bundle's feature contract.
+
+        The whole warm-up-trimmed window is returned, not just the last bar: the HMM's
+        posterior for the current bar is only meaningful when the forward pass has the
+        preceding sequence to run over (see :meth:`_predict_probs`).
+        """
         b = self._bundle
         feature_names: list[str] = b["feature_names"]
         direction = b.get("direction_feature", "trend_20")
@@ -189,20 +194,31 @@ class LiveRegimeDetector:
             return None
         last = feats.iloc[-1]
         as_of = str(pd.to_datetime(last["bar_time_utc"], utc=True)) if "bar_time_utc" in feats else None
-        vec = last[feature_names].to_numpy(dtype="float64").reshape(1, -1)
-        return vec, (as_of or "")
+        mat = feats[feature_names].to_numpy(dtype="float64")
+        return mat, (as_of or "")
 
-    def _predict_probs(self, granularity: str, vec: np.ndarray) -> np.ndarray:
-        """Apply scaler+weights and return raw-state posteriors for one sample."""
+    def _predict_probs(self, granularity: str, mat: np.ndarray) -> np.ndarray:
+        """Raw-state posteriors for the LAST bar, conditioned on the whole window.
+
+        hmmlearn scores a *sequence*. Passing a single bar collapses the posterior to
+        ``normalize(startprob_ * emission)``: the transition matrix is never consulted
+        and a degenerate trained ``startprob_`` becomes a permanent prior — any state
+        with ``startprob_ == 0`` can then never be emitted, at any time, for any input.
+        Feeding the window lets the forward recursion do its job; ``startprob_`` only
+        anchors the oldest bar, whose influence decays.
+
+        Still causal: we take the final row, whose backward term is 1, so it depends
+        on bars <= t only — no lookahead leaks into a live trading decision.
+        """
         model_obj = self._bundle["models"][granularity]
         scaler = model_obj["scaler"]
         weights = np.asarray(model_obj["weights"], dtype="float64")
-        x = scaler.transform(vec) * weights
+        x = scaler.transform(mat) * weights
         model = model_obj["model"]
         if hasattr(model, "predict_proba"):
-            return np.asarray(model.predict_proba(x))[0]
-        # K-Means fallback model: one-hot the assigned cluster.
-        state = int(model.predict(x)[0])
+            return np.asarray(model.predict_proba(x))[-1]
+        # K-Means fallback model: no temporal structure, so classify the last bar alone.
+        state = int(model.predict(x[-1:])[0])
         n = int(getattr(model, "n_clusters", len(model_obj["mapping"])))
         onehot = np.zeros(n)
         onehot[state] = 1.0
@@ -229,14 +245,14 @@ class LiveRegimeDetector:
                       error=type(exc).__name__, detail=str(exc))
             return self._stale(key, granularity, f"candle fetch error: {type(exc).__name__}")
 
-        fv = self._feature_vector(candles)
+        fv = self._feature_matrix(candles)
         if fv is None:
             log_event(log, logging.WARNING, "insufficient candle history; holding last regime",
                       instrument=instrument, granularity=granularity, rows=len(candles))
             return self._stale(key, granularity, "insufficient history")
 
-        vec, as_of = fv
-        probs_state = self._predict_probs(granularity, vec)
+        mat, as_of = fv
+        probs_state = self._predict_probs(granularity, mat)
         mapping = {int(k): v for k, v in self._bundle["models"][granularity]["mapping"].items()}
         raw_state = int(np.argmax(probs_state))
         raw_label = mapping[raw_state]

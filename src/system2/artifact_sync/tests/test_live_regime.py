@@ -138,6 +138,36 @@ def test_detect_is_deterministic(detector):
     assert obs1.raw_state == obs2.raw_state
 
 
+def test_posterior_uses_the_sequence_not_just_the_last_bar(detector):
+    """Regression: inference must score the window, never a length-1 sequence.
+
+    hmmlearn collapses a single-bar sequence to normalize(startprob_ * emission),
+    which discards transmat_ and lets a degenerate startprob_ pin the label forever.
+    The 2026-07 production bundle had H1 startprob_ = [0.2, 0, 0.8, 0], so two of the
+    four regimes were unreachable for every input — the classifier sat on one label
+    for 832 straight observations. Guard both halves: the detector must feed >1 row,
+    and its posterior must match the sequence result rather than the last-bar one.
+    """
+    det, _root, _src = detector
+    det.load_bundle()
+    candles = _src.df.tail(det.lookback).reset_index(drop=True)
+    mat, _as_of = det._feature_matrix(candles)
+    assert mat.shape[0] > 1, "feature matrix must carry the window, not one bar"
+
+    mo = det._bundle["models"]["H1"]
+    x = mo["scaler"].transform(mat) * np.asarray(mo["weights"], dtype="float64")
+    seq_probs = np.asarray(mo["model"].predict_proba(x))[-1]
+    single_probs = np.asarray(mo["model"].predict_proba(x[-1:].copy()))[0]
+
+    got = det._predict_probs("H1", mat)
+    assert got == pytest.approx(seq_probs)
+    # A single-bar posterior can never put mass on a zero-startprob state; the
+    # sequence posterior can. If the two ever coincide this test is not proving much.
+    zero_start = [i for i, p in enumerate(mo["model"].startprob_) if p == 0.0]
+    for i in zero_start:
+        assert single_probs[i] == 0.0
+
+
 def test_unknown_granularity_is_stale(detector):
     det, _root, _src = detector
     obs = det.detect("EUR_USD", "H4")  # bundle only has H1
