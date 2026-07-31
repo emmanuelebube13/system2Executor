@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -135,6 +136,52 @@ def test_duplicate_idempotency_key_skipped():
     res2 = pipe.process(_orders()[0], 1.10000, submit_fn=lambda c: submits.append(c) or {"id": "fill2"})
     assert res2["decision"] is Decision.SKIPPED_DUPLICATE
     assert len(submits) == 1  # exactly one broker submit
+
+
+def test_mark_lands_before_persist_so_a_post_fill_failure_cannot_resubmit():
+    """F-303: ``mark()`` used to run AFTER persist/emit.
+
+    A persist failure (Fact_Live_Trades write) after a successful broker fill propagates to the
+    consumer, which nacks for redelivery — and the redelivery found ``seen()`` still False and
+    submitted a SECOND live order for one approved order. The marker must outlive anything that
+    can fail after the fill.
+    """
+    store = InMemoryProcessedStore()
+    submits = []
+    pipe = ExecutionPipeline(mode=ExecMode.EXECUTION_ONLY, shadow=False, processed_store=store,
+                             clock=lambda: datetime(2026, 6, 24, 12, tzinfo=timezone.utc))
+    order = _orders()[0]
+
+    def boom(_c, _f):
+        raise RuntimeError("simulated Fact_Live_Trades write failure")
+
+    with pytest.raises(RuntimeError):
+        pipe.process(order, 1.10000,
+                     submit_fn=lambda c: submits.append(c) or {"id": "fill1"}, persist_fn=boom)
+    assert store.seen(order.idempotency_key)  # marked despite the failure that followed
+
+    res = pipe.process(order, 1.10000,
+                       submit_fn=lambda c: submits.append(c) or {"id": "fill2"})
+    assert res["decision"] is Decision.SKIPPED_DUPLICATE
+    assert len(submits) == 1  # the broker saw the order ONCE
+
+
+def test_signal_id_guard_blocks_a_second_order_for_the_same_signal():
+    """Defence in depth (F-206): one approved signal => at most one broker order, even if
+    System 3 regresses and re-mints ``order_request_id`` for a signal it already published."""
+    store = InMemoryProcessedStore()
+    submits = []
+    pipe = ExecutionPipeline(mode=ExecMode.EXECUTION_ONLY, shadow=False, processed_store=store,
+                             clock=lambda: datetime(2026, 6, 24, 12, tzinfo=timezone.utc))
+    base = _orders()[0]
+    first = dataclasses.replace(base, idempotency_key="ord-a", signal_id="sig-9")
+    reminted = dataclasses.replace(base, idempotency_key="ord-b", signal_id="sig-9")
+
+    assert pipe.process(first, 1.10000,
+                        submit_fn=lambda c: submits.append(c))["decision"] is Decision.EXECUTED
+    res = pipe.process(reminted, 1.10000, submit_fn=lambda c: submits.append(c))
+    assert res["decision"] is Decision.SKIPPED_DUPLICATE
+    assert len(submits) == 1  # a different order id no longer buys a second position
 
 
 # ----- backup correlation guard ---------------------------------------------------

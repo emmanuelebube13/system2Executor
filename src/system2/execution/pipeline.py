@@ -249,6 +249,21 @@ class InMemoryProcessedStore:
         self._seen.add(key)
 
 
+def guard_keys(order: "ApprovedOrder") -> list[str]:
+    """Every key an approved order must be deduped on, most specific first.
+
+    ``idempotency_key`` is the order identity (System 3's ``order_request_id``, relayed by the
+    bridge). ``signal_id`` is added as **defence in depth** (F-206/F-303): System 3 is supposed
+    to derive one stable order id per signal, but if it ever re-mints one, the order id stops
+    deduping while the signal still does — so a Guardian fault cannot double a live position
+    on System 2's watch. One approved signal ⇒ at most one broker order, by construction.
+    """
+    keys = [order.idempotency_key]
+    if order.signal_id is not None and str(order.signal_id) != "":
+        keys.append(f"signal:{order.signal_id}")
+    return keys
+
+
 # --------------------------------------------------------------------------- #
 # The slim pipeline
 # --------------------------------------------------------------------------- #
@@ -322,10 +337,11 @@ class ExecutionPipeline:
                       idempotency_key=order.idempotency_key)
             return {"decision": Decision.DEFERRED_LEGACY, "order": None, "fill": None}
 
-        if self.processed.seen(order.idempotency_key):
-            log_event(log, logging.INFO, "duplicate idempotency_key; skipping",
-                      idempotency_key=order.idempotency_key)
-            return {"decision": Decision.SKIPPED_DUPLICATE, "order": None, "fill": None}
+        for key in guard_keys(order):
+            if self.processed.seen(key):
+                log_event(log, logging.INFO, "already executed; skipping",
+                          idempotency_key=order.idempotency_key, dedup_key=key)
+                return {"decision": Decision.SKIPPED_DUPLICATE, "order": None, "fill": None}
 
         if not is_in_session(self._clock()):
             log_event(log, logging.WARNING, "order outside trading session; rejected",
@@ -361,11 +377,26 @@ class ExecutionPipeline:
         if submit_fn is None:
             raise ValueError("submit_fn required in non-shadow execution_only mode (wired by EXEC-006)")
         fill = submit_fn(constructed)
-        if persist_fn is not None:
-            persist_fn(constructed, fill)
-        if emit_fn is not None:
-            emit_fn(constructed, fill)
-        self.processed.mark(order.idempotency_key)
+        # F-303: the broker now holds this order, so the idempotency marker must land BEFORE
+        # anything that can still fail. ``mark()`` used to come AFTER persist/emit, and a
+        # persist failure (Fact_Live_Trades write) nacks the message => redelivery => a SECOND
+        # broker order for the same approved order. The store autocommits, so nothing the
+        # consumer does afterwards can roll the marker back.
+        for key in guard_keys(order):
+            self.processed.mark(key)
+        try:
+            if persist_fn is not None:
+                persist_fn(constructed, fill)
+            if emit_fn is not None:
+                emit_fn(constructed, fill)
+        except Exception:  # noqa: BLE001 — re-raised; this only makes the state explicit
+            # The order IS filled and IS marked: it will never be resubmitted. Say so loudly —
+            # the local trade record / fill relay is now behind the broker and needs reconciling.
+            log_event(log, logging.ERROR,
+                      "order FILLED but a post-fill hook failed; not resubmittable — reconcile",
+                      idempotency_key=order.idempotency_key, instrument=order.instrument,
+                      units=order.units)
+            raise
         log_event(log, logging.INFO, "order executed",
                   idempotency_key=order.idempotency_key, instrument=order.instrument,
                   units=order.units, sl=constructed.stop_loss, tp=constructed.take_profit)
