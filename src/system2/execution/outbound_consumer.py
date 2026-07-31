@@ -9,8 +9,10 @@ In ``EXEC_MODE=execution_only`` Layer 4 sources work ONLY from the queue (never
 
 An order is ack'd only after it is *durably handled* (submitted+recorded, or definitively
 rejected) so a crash mid-processing redelivers rather than loses the order. Dedup is
-persistent (``SqliteProcessedStore``) so a redelivered ``idempotency_key`` is recognised
-across restarts and never produces a second broker order. Consumer lag (last message
+persistent (``SqliteProcessedStore``) so a redelivered ``idempotency_key`` — and the source
+``signal_id``, guarded too (F-206/F-303) — is recognised across restarts and never produces
+a second broker order; the marker is written the instant the broker fills, before any hook
+that could still fail. Consumer lag (last message
 timestamp, last poll time) is exposed for EXEC-008 staleness detection + Layer 5.
 """
 
@@ -25,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from system2.common.logging import get_logger, log_event
-from system2.execution.pipeline import ApprovedOrder, Decision, ExecutionPipeline
+from system2.execution.pipeline import ApprovedOrder, Decision, ExecutionPipeline, guard_keys
 from system2.execution.validation import is_expired, validate_envelope
 
 log = get_logger("execution.outbound_consumer")
@@ -165,11 +167,14 @@ class OutboundConsumer:
         order = ApprovedOrder.from_dict(raw)
 
         # --- dedup before doing any work (cheap, persistent) ---
-        if self.pipeline.processed.seen(order.idempotency_key):
-            log_event(log, logging.INFO, "duplicate idempotency_key -> ack/skip",
-                      idempotency_key=order.idempotency_key)
-            msg.ack()
-            return "duplicate"
+        # Both the order identity and the source signal (F-206/F-303 defence in depth) —
+        # see ``pipeline.guard_keys``.
+        for key in guard_keys(order):
+            if self.pipeline.processed.seen(key):
+                log_event(log, logging.INFO, "already executed -> ack/skip",
+                          idempotency_key=order.idempotency_key, dedup_key=key)
+                msg.ack()
+                return "duplicate"
 
         # --- market-hours guard: park (nack w/ backoff), do not submit ---
         from system2.execution.pipeline import is_in_session

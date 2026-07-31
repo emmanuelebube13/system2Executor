@@ -41,7 +41,7 @@ def queue(tmp_path: Path) -> LocalDurableBackend:
     q.close()
 
 
-def _consumer(queue, tmp_path, *, clock=lambda: WED, submits=None, shadow=False):
+def _consumer(queue, tmp_path, *, clock=lambda: WED, submits=None, shadow=False, persist_fn=None):
     store = SqliteProcessedStore(tmp_path / "processed.db")
     pipe = ExecutionPipeline(
         mode=ExecMode.EXECUTION_ONLY, shadow=shadow, processed_store=store, clock=clock,
@@ -50,7 +50,7 @@ def _consumer(queue, tmp_path, *, clock=lambda: WED, submits=None, shadow=False)
     return OutboundConsumer(
         queue=queue, subscription=SUB, pipeline=pipe,
         price_fn=lambda o: PRICES[o.instrument],
-        submit_fn=submit_fn, clock=clock,
+        submit_fn=submit_fn, persist_fn=persist_fn, clock=clock,
     ), store
 
 
@@ -121,6 +121,43 @@ def test_crash_safety_redelivery_not_resubmitted(queue, tmp_path):
     queue.publish(SUB, _order_msg(message_id="redeliver"))  # same idempotency_key k1
     consumer2.poll_once()
     assert len(submits) == 1  # NOT re-submitted across the restart
+
+
+def test_persist_failure_after_fill_is_not_resubmitted_on_redelivery(queue, tmp_path):
+    """F-303 end-to-end: one transient Fact_Live_Trades failure after a successful fill.
+
+    persist_fn raises => the consumer nacks => the queue redelivers. Before the fix the
+    redelivery found no marker and placed a SECOND live order for one approved order.
+    """
+    submits: list = []
+    calls = {"n": 0}
+
+    def flaky_persist(_c, _f):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated Fact_Live_Trades write failure")
+
+    consumer, _ = _consumer(queue, tmp_path, submits=submits, persist_fn=flaky_persist)
+    consumer.park_backoff_sec = 0.0  # redeliver on the next poll, no sleeping
+    queue.publish(SUB, _order_msg())
+
+    assert consumer.poll_once() == {"exec_error": 1}
+    assert len(submits) == 1
+    assert consumer.poll_once() == {"duplicate": 1}
+    assert len(submits) == 1  # the broker saw the order ONCE
+
+
+def test_signal_id_guard_blocks_a_remitted_order_id(queue, tmp_path):
+    """Defence in depth (F-206): a second order id for a signal already executed is dropped."""
+    submits: list = []
+    consumer, _ = _consumer(queue, tmp_path, submits=submits)
+    queue.publish(SUB, _order_msg(idempotency_key="ord-a", signal_id="sig-9"))
+    assert consumer.poll_once() == {"executed": 1}
+
+    queue.publish(SUB, _order_msg(idempotency_key="ord-b", message_id="m-ord-b",
+                                  signal_id="sig-9"))
+    assert consumer.poll_once() == {"duplicate": 1}
+    assert len(submits) == 1
 
 
 def test_lag_tracking_updates(queue, tmp_path):
