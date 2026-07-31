@@ -68,3 +68,29 @@
 <!-- Future mandatory log points: any credential supplied/rotated; any practice→live toggle (see D-004);
      model artifact set promoted into live inference; legacy→slim Layer-4 cutover; any clearing of HALTED;
      any auditor-gate override. STOP and ask the human, then record here, before proceeding. -->
+
+---
+
+### D-005 — 2026-W31 remediation: the circuit breaker stays CLOSED
+- **Timestamp (UTC):** 2026-07-31
+- **Status:** ✅ DECIDED — breaker remains engaged; no reset.
+- **Question:** The account has been `CIRCUIT_BROKEN` since the 14-trade / −3,693 CAD run, and
+  System 3 is rejecting 100% of decisions at Layer A. Should the breaker be reset so execution-path
+  fixes can be verified end to end?
+- **Chosen:** **No.** The breaker stays closed for the duration of the remediation campaign. It is
+  not to be revisited until BOTH (a) FIX_PLAN Group 1 has landed and been independently verified,
+  and (b) System 1's §9 question — why all realised trades lost — has been answered with the
+  per-trade live-vs-backtest gap analysis.
+- **Rationale:** an unlocked account combined with the still-live duplicate-order paths
+  (F-206 + F-303, both P0, both reproduced on 2026-07-31) is the one combination that can actually
+  lose money. Verification of execution-path fixes will be done against harnesses and shadow
+  payloads, not against a live account. Per the S1 handoff §0: correct sizing of a
+  negative-edge strategy loses money *faster*; the jam is currently the only thing preventing
+  further loss.
+- **Note on scope:** the account is OANDA **practice** (`101-002-38449021-001`, mode `demo`,
+  stage `paper`), so the recorded losses are not real capital. The decision stands regardless —
+  the defects would be real on a live account, and D-004 (shadow→live cutover) is still PENDING.
+- **Decided-by:** Emmanuel (human) — via the 2026-07-31 remediation plan approval.
+- **Recorded-by:** ORCHESTRATOR-v2
+- **Affected:** blocks any `/reset_breaker`; gates FIX_PLAN Group 1 verification strategy;
+  interacts with D-004 and with owner decisions OD-3/OD-4 in `audit/state/orchestrator-state.json`.
