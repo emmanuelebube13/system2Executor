@@ -1,7 +1,12 @@
-"""Tests for the LocalDurableBackend queue (publish/pull/ack/nack/DLQ + envelope)."""
+"""Tests for the LocalDurableBackend queue (publish/pull/ack/nack/DLQ + envelope).
+
+The ``lease`` block at the bottom is the F-307 regression set: a message pulled but never
+acked used to sit in ``inflight`` forever, so a crash silently lost an approved order.
+"""
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -84,3 +89,105 @@ def test_fifo_order_preserved(backend: LocalDurableBackend):
         backend.publish("orders", {"i": i})
     msgs = backend.pull("orders", max_messages=3)
     assert [m.body["i"] for m in msgs] == [0, 1, 2]
+
+
+# --------------------------------------------------------------------------- #
+# In-flight lease / reaper (F-307)
+# --------------------------------------------------------------------------- #
+def test_crash_before_ack_redelivers_after_restart(tmp_path: Path):
+    """The contract in the module docstring: "a crash mid-processing redelivers".
+
+    Before the lease, ``q2`` saw nothing and the approved order was lost with no DLQ
+    entry, no counter and no alert (audit/findings/F-307).
+    """
+    path = tmp_path / "queue.db"
+    q1 = LocalDurableBackend(path, max_attempts=3)
+    q1.publish("orders", {"x": 1})
+    assert len(q1.pull("orders")) == 1
+    q1.close()                                    # the process dies: no ack, no nack
+
+    q2 = LocalDurableBackend(path, max_attempts=3)          # operator restarts it
+    again = q2.pull("orders")
+    assert [m.body for m in again] == [{"x": 1}]
+    assert again[0].attempts == 2                 # the attempt counter survived the crash
+    again[0].ack()
+    assert q2.pull("orders") == []
+    q2.close()
+
+
+def test_expired_lease_is_reclaimed_by_a_long_running_consumer(tmp_path: Path):
+    """The reaper must work mid-life, not only at startup: same instance, same process."""
+    q = LocalDurableBackend(tmp_path / "queue.db", max_attempts=3, lease_sec=0.0)
+    q.publish("orders", {"x": 1})
+    q.pull("orders")                              # taken, then dropped on the floor
+    assert q.depth("orders", "inflight") == 1
+    again = q.pull("orders")                      # the same instance reclaims it
+    assert len(again) == 1 and again[0].attempts == 2
+    q.close()
+
+
+def test_live_lease_is_not_reclaimed(backend: LocalDurableBackend):
+    """A consumer that is merely slow keeps its message for the whole lease."""
+    backend.publish("orders", {"x": 1})
+    backend.pull("orders")
+    assert backend.reclaim("orders") == 0
+    assert backend.pull("orders") == []
+
+
+def test_orphaned_message_is_dead_lettered_at_max_attempts(tmp_path: Path):
+    """An expired lease must not become an infinite poison loop (max_attempts=3)."""
+    q = LocalDurableBackend(tmp_path / "queue.db", max_attempts=3, lease_sec=0.0)
+    q.publish("orders", {"x": 1})
+    for _ in range(4):
+        q.pull("orders")                          # pull, crash, pull, crash, ...
+    assert q.pull("orders") == []                 # no longer redelivered
+    assert q.depth("orders", "dead") == 1
+    dlq = q.pull("orders.dlq")
+    assert dlq[0].body["original"] == {"x": 1}
+    assert "max_attempts" in dlq[0].body["dlq_reason"]
+    assert dlq[0].body["attempts"] == 3
+    q.close()
+
+
+def test_ack_from_a_reclaimed_consumer_is_a_no_op(tmp_path: Path):
+    """The stale owner coming back must not ack the copy someone else now owns.
+
+    ``ack_id`` is regenerated on every pull, so it doubles as the fencing token.
+    """
+    path = tmp_path / "queue.db"
+    q1 = LocalDurableBackend(path, max_attempts=3, lease_sec=0.0)
+    q1.publish("orders", {"x": 1})
+    stale = q1.pull("orders")[0]
+    q2 = LocalDurableBackend(path, max_attempts=3)
+    fresh = q2.pull("orders")[0]                  # reclaimed by the restarted consumer
+    stale.ack()                                   # the zombie finally finishes
+    assert q2.depth("orders", "inflight") == 1    # still owned by q2, not marked done
+    fresh.ack()
+    assert q2.depth("orders", "done") == 1
+    q1.close()
+    q2.close()
+
+
+def test_recovers_a_queue_db_written_before_the_lease_existed(tmp_path: Path):
+    """A pre-fix queue.db has no lease columns and may already hold stranded rows."""
+    path = tmp_path / "queue.db"
+    con = sqlite3.connect(str(path), isolation_level=None)
+    con.execute(
+        """CREATE TABLE queue(
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            topic TEXT NOT NULL, body TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'ready',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            available_at REAL NOT NULL DEFAULT 0,
+            ack_id TEXT)"""
+    )
+    con.execute("INSERT INTO queue(topic, body, state, attempts, ack_id) "
+                "VALUES ('orders', '{\"stranded\": true}', 'inflight', 1, 'old-ack')")
+    con.close()
+
+    q = LocalDurableBackend(path, max_attempts=3)
+    cols = {r[1] for r in q._conn.execute("PRAGMA table_info(queue)")}
+    assert {"leased_until", "lease_owner"} <= cols
+    msgs = q.pull("orders")
+    assert [m.body for m in msgs] == [{"stranded": True}]
+    q.close()
