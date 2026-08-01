@@ -21,6 +21,7 @@ to the legacy formula (dual-run) before cutover. See docs/SYSTEM_BOUNDARY.md.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -156,6 +157,80 @@ class InvalidOrderError(Exception):
     """Order cannot be constructed (bad ATR, wrong-side SL/TP)."""
 
 
+class NoMarketPriceError(InvalidOrderError):
+    """No usable market price for the expected-entry reference — refuse to construct.
+
+    F-306: the reference price used to be ``suggested_sl or atr`` (lifecycle ``_price_fn``),
+    i.e. the STOP price, or — when System 3 sent no suggestion — a raw ATR (~0.0016) used as
+    if it were a price, which constructed a BUY with ``SL = 0.0016 - 0.0016 = 0.0``. A missing
+    price is a **reject**, never a guess: an order with no real market reference cannot be
+    sized-checked, cannot be slippage-checked, and can carry a structurally invalid stop.
+    """
+
+
+# --------------------------------------------------------------------------- #
+# Price sanity — fail-closed gate in front of all order construction (F-306)
+# --------------------------------------------------------------------------- #
+def require_market_price(instrument: str, entry_price: Any) -> float:
+    """Return ``entry_price`` as a usable market price, or raise ``NoMarketPriceError``.
+
+    Fail-closed by design: ``None``, NaN/Inf and non-positive values are all *absence of a
+    price*, and the only safe response to that is to refuse to build the order.
+    """
+    if entry_price is None:
+        raise NoMarketPriceError(
+            f"{instrument}: no market price available for the expected-entry reference; "
+            "refusing to construct an order (fail-closed)"
+        )
+    try:
+        price = float(entry_price)
+    except (TypeError, ValueError) as exc:
+        raise NoMarketPriceError(f"{instrument}: entry price {entry_price!r} is not a number") from exc
+    if not math.isfinite(price):
+        raise NoMarketPriceError(f"{instrument}: entry price {price!r} is not finite")
+    if price <= 0:
+        raise NoMarketPriceError(f"{instrument}: entry price {price!r} is not positive")
+    return price
+
+
+def assert_protective_prices(
+    instrument: str, direction: int, entry_price: float, stop_loss: Any, take_profit: Any
+) -> tuple[float, float]:
+    """Last-line invariant on the constructed SL/TP. Raises ``InvalidOrderError``.
+
+    Two rules, both absolute:
+      1. **A stop-loss or take-profit is never <= 0.** A zero/negative protective price is
+         either a broker reject or — worse, if the broker takes it — an unprotected position.
+         This is the F-306 headline: ATR-as-entry produced ``SL = 0.0`` and it reached order
+         construction because the ``suggested_sl``/``suggested_tp`` branch validated nothing.
+      2. **SL and TP are on the correct side of the entry price.** ``_atr_stops`` already
+         enforced this for the ATR branch; System-3-supplied prices were previously taken
+         verbatim, so a stale/mismatched suggestion could invert the trade's risk.
+    """
+    for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
+        if value is None:
+            raise InvalidOrderError(f"{instrument}: {name} is missing")
+        value = float(value)
+        if not math.isfinite(value) or value <= 0:
+            raise InvalidOrderError(
+                f"{instrument}: {name}={value} is not a positive price "
+                f"(entry={entry_price}); refusing to construct an order"
+            )
+    stop_loss, take_profit = float(stop_loss), float(take_profit)
+    if direction == 1:
+        if stop_loss >= entry_price or take_profit <= entry_price:
+            raise InvalidOrderError(
+                f"{instrument}: BUY SL/TP wrong side: entry={entry_price} "
+                f"SL={stop_loss} TP={take_profit}"
+            )
+    elif stop_loss <= entry_price or take_profit >= entry_price:
+        raise InvalidOrderError(
+            f"{instrument}: SELL SL/TP wrong side: entry={entry_price} "
+            f"SL={stop_loss} TP={take_profit}"
+        )
+    return stop_loss, take_profit
+
+
 # --------------------------------------------------------------------------- #
 # ATR stop/target math — single source of truth (preserved contract)
 # --------------------------------------------------------------------------- #
@@ -288,16 +363,27 @@ class ExecutionPipeline:
         )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-    def build_order(self, order: ApprovedOrder, entry_price: float) -> ConstructedOrder:
+    def build_order(self, order: ApprovedOrder, entry_price: float | None) -> ConstructedOrder:
         """Pure, deterministic construction (ATR stops + AMS units). Raises on invalid.
 
         ``units`` is taken from the order verbatim — never modified.
+
+        ``entry_price`` must be a **real market price** for ``order.instrument``. F-306:
+        it used to be the stop price (or, absent a suggestion, a raw ATR), which made every
+        fill look like it slipped by the SL distance and let an order be built with
+        ``SL = 0.0``. ``entry_price=None`` means "the price source had nothing" and is a
+        hard reject — see ``require_market_price``; never substitute a guess.
         """
         rc = order.risk_context
+        price = require_market_price(order.instrument, entry_price)
         if rc.suggested_sl is not None and rc.suggested_tp is not None:
             stop_loss, take_profit = rc.suggested_sl, rc.suggested_tp
         else:
-            stop_loss, take_profit = _atr_stops(order.direction, entry_price, rc.atr)
+            stop_loss, take_profit = _atr_stops(order.direction, price, rc.atr)
+        stop_loss, take_profit = assert_protective_prices(
+            order.instrument, order.direction, price, stop_loss, take_profit
+        )
+        entry_price = price
         return ConstructedOrder(
             idempotency_key=order.idempotency_key,
             correlation_id=order.correlation_id,
@@ -314,7 +400,7 @@ class ExecutionPipeline:
     def process(
         self,
         order: ApprovedOrder,
-        entry_price: float,
+        entry_price: float | None,
         open_instruments: Iterable[str] = (),
         submit_fn: Callable[[ConstructedOrder], Any] | None = None,
         persist_fn: Callable[[ConstructedOrder, Any], None] | None = None,
@@ -329,6 +415,9 @@ class ExecutionPipeline:
         failure short-circuits to ``REJECTED_VALIDATION`` (durably handled — ack, no retry).
         Returns a result dict with the decision, the constructed order (if any), and the
         fill (if submitted).
+
+        ``entry_price`` may be ``None`` when the market-price source had nothing to give;
+        that is a ``REJECTED_INVALID`` (durably acked, never submitted), not a fallback.
         """
         set_correlation_id(order.correlation_id)
 
@@ -350,6 +439,13 @@ class ExecutionPipeline:
 
         try:
             constructed = self.build_order(order, entry_price)
+        except NoMarketPriceError as exc:
+            # F-306 fail-closed branch: no price ⇒ no order. Loud, because a price source that
+            # is silently down means the engine is dropping approved orders on the floor.
+            log_event(log, logging.ERROR, "no market price; order NOT constructed (fail-closed)",
+                      idempotency_key=order.idempotency_key, instrument=order.instrument,
+                      detail=str(exc))
+            return {"decision": Decision.REJECTED_INVALID, "order": None, "fill": None, "reason": str(exc)}
         except InvalidOrderError as exc:
             log_event(log, logging.ERROR, "invalid order; rejected",
                       idempotency_key=order.idempotency_key, detail=str(exc))

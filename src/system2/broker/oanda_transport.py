@@ -15,6 +15,7 @@ from system2.broker.oanda_adapter import (
     BrokerEnvironment,
     MarketClosedError,
     TransientBrokerError,
+    format_price,
     resolve_environment,
 )
 from system2.common.secrets import Secrets, get_secrets
@@ -78,11 +79,42 @@ class OandaRestTransport:
         resp = self._request(TradeDetails(accountID=self.env.account_id, tradeID=trade_id))
         return resp.get("trade")
 
-    def modify_trade_stop(self, trade_id: str, stop_price: float) -> dict[str, Any]:
+    def modify_trade_stop(
+        self, trade_id: str, stop_price: float, instrument: str | None = None
+    ) -> dict[str, Any]:
         from oandapyV20.endpoints.trades import TradeCRCDO
 
-        data = {"stopLoss": {"price": f"{stop_price:.5f}", "timeInForce": "GTC"}}
+        # F-308: was ``f"{stop_price:.5f}"`` for every instrument. USD_JPY allows 3 decimals,
+        # so every JPY stop-move (including the "attach a missing stop or mark the position
+        # UNSAFE" repair path) was sent with an illegal price.
+        price = format_price(stop_price, instrument or self._instrument_of(trade_id) or "")
+        data = {"stopLoss": {"price": price, "timeInForce": "GTC"}}
         return self._request(TradeCRCDO(accountID=self.env.account_id, tradeID=trade_id, data=data))
+
+    def _instrument_of(self, trade_id: str) -> str | None:
+        """Last-resort instrument lookup so a caller that omitted it still gets the right grid."""
+        try:
+            trade = self.get_trade(trade_id) or {}
+        except Exception:  # noqa: BLE001 — best effort; falls back to the default precision
+            return None
+        return trade.get("instrument")
+
+    def get_pricing(self, instruments: list[str]) -> list[dict[str, Any]]:
+        """Current tradeable quotes (F-306 expected-entry reference). Read-only."""
+        from oandapyV20.endpoints.pricing import PricingInfo
+
+        resp = self._request(
+            PricingInfo(accountID=self.env.account_id, params={"instruments": ",".join(instruments)})
+        )
+        return resp.get("prices", [])
+
+    def get_account_instruments(self, instruments: list[str] | None = None) -> list[dict[str, Any]]:
+        """Instrument specs (``displayPrecision``/``pipLocation``) for F-308 formatting. Read-only."""
+        from oandapyV20.endpoints.accounts import AccountInstruments
+
+        params = {"instruments": ",".join(instruments)} if instruments else None
+        resp = self._request(AccountInstruments(accountID=self.env.account_id, params=params))
+        return resp.get("instruments", [])
 
     def close_trade(self, trade_id: str, units: str | int = "ALL") -> dict[str, Any]:
         from oandapyV20.endpoints.trades import TradeClose

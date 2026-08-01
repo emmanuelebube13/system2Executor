@@ -136,7 +136,7 @@ class ClosingAdapter:
         self.closed.append(trade_id)
         return self.response
 
-    def modify_stop(self, trade_id, new_stop):
+    def modify_stop(self, trade_id, new_stop, instrument=None):
         return {"ok": True}
 
 

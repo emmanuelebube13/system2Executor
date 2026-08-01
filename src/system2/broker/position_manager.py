@@ -181,7 +181,9 @@ class PositionManager:
 
     # ----- broker mutations (idempotent, via EXEC-006) ----------------------
     def _set_stop(self, trade: ManagedTrade, new_stop: float) -> None:
-        self.adapter.modify_stop(trade.broker_trade_id, new_stop)
+        # ``instrument`` is required by the adapter so the price is rendered at the
+        # instrument's displayPrecision — a JPY stop-move is rejected otherwise (F-308).
+        self.adapter.modify_stop(trade.broker_trade_id, new_stop, trade.instrument)
         trade.current_stop = new_stop
         log_event(log, logging.INFO, "stop modified",
                   trade_id=trade.broker_trade_id, new_stop=new_stop,
