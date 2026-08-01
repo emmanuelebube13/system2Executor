@@ -19,6 +19,8 @@ Two layers, deliberately separate because they have different failure handling:
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -87,6 +89,8 @@ def validate_envelope(raw: Any) -> ValidationResult:
         units = float(raw["units"])
     except (TypeError, ValueError):
         return ValidationResult.failed("units", f"units not numeric: {raw.get('units')!r}")
+    if not math.isfinite(units):
+        return ValidationResult.failed("units", f"units is not a finite number: {units}")
     if units == 0:
         return ValidationResult.failed("zero_units", "units == 0")
 
@@ -97,6 +101,14 @@ def validate_envelope(raw: Any) -> ValidationResult:
         atr = float(rc.get("atr"))
     except (TypeError, ValueError):
         return ValidationResult.failed("risk_context", f"risk_context.atr not numeric: {rc.get('atr')!r}")
+    # NaN/Inf must be rejected BEFORE the bound check: every comparison against NaN is False,
+    # so `atr <= 0` passes NaN, and +Inf passes it too. The full-loop chaos matrix
+    # (audit/loop/test_f2_chaos_matrix.py) showed a non-finite ATR entering at THIS boundary
+    # was caught nowhere and reached the broker as a real order. System 3 rejects non-finite
+    # values at its own contract validator (F-203), but System 2 is the process that talks to
+    # the broker and must not depend on an upstream check it cannot see.
+    if not math.isfinite(atr):
+        return ValidationResult.failed("risk_context", f"risk_context.atr is not a finite number: {atr}")
     if atr <= 0:
         return ValidationResult.failed("risk_context", f"risk_context.atr must be > 0, got {atr}")
 
