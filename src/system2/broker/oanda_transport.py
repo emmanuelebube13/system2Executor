@@ -22,6 +22,9 @@ from system2.common.secrets import Secrets, get_secrets
 
 _MARKET_CLOSED_TOKENS = ("MARKET_HALTED", "MARKET_CLOSED", "TRADING_HALTED")
 
+# OANDA rejects a ``transactions/idrange`` page wider than 1000 ids.
+MAX_TRANSACTION_ID_RANGE = 1000
+
 
 class OandaRestTransport:
     """Concrete ``OandaTransport`` over oandapyV20 (lazy import)."""
@@ -115,6 +118,55 @@ class OandaRestTransport:
         params = {"instruments": ",".join(instruments)} if instruments else None
         resp = self._request(AccountInstruments(accountID=self.env.account_id, params=params))
         return resp.get("instruments", [])
+
+    # ----- transaction history (F-303 pre-submit reconcile) -----------------
+    def get_transactions_idrange(self, from_id: int, to_id: int) -> list[dict[str, Any]]:
+        """One inclusive ``transactions/idrange`` page. Read-only.
+
+        Promoted to a first-class transport method so the adapter's pre-submit reconcile has
+        a bounded transaction reader, and so ``close_tracker.fetch_transaction_range`` — which
+        already prefers this exact name (close_tracker.py:348) — stops reaching through
+        ``transport._request``.
+        """
+        from oandapyV20.endpoints.transactions import TransactionIDRange
+
+        resp = self._request(
+            TransactionIDRange(
+                accountID=self.env.account_id,
+                params={"from": str(int(from_id)), "to": str(int(to_id))},
+            )
+        )
+        return resp.get("transactions", [])
+
+    def get_recent_transactions(self, count: int = 200) -> list[dict[str, Any]]:
+        """The last ``count`` account transactions — bounded, never a full-history scan.
+
+        Two read-only GETs: the account summary for the authoritative ``lastTransactionID``
+        head, then one id-range page ending at it. The head is re-read on every call on
+        purpose — a watermark cached in this process would miss an order placed *after* it by
+        another consumer, or by this consumer before the crash, which is precisely the case
+        F-303's pre-submit reconcile exists to catch.
+
+        Raises rather than returning ``[]`` when the lookup fails: an empty list is read by
+        the adapter as "verified — no such transaction", and a failed lookup must never be
+        mistaken for that.
+        """
+        head = self._last_transaction_id()
+        window = max(1, min(int(count), MAX_TRANSACTION_ID_RANGE))
+        return self.get_transactions_idrange(max(1, head - window + 1), head)
+
+    def _last_transaction_id(self) -> int:
+        """The account's current ``lastTransactionID`` (present at both levels of the reply)."""
+        from oandapyV20.endpoints.accounts import AccountSummary
+
+        resp = self._request(AccountSummary(accountID=self.env.account_id))
+        raw = resp.get("lastTransactionID") or (resp.get("account") or {}).get("lastTransactionID")
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as exc:
+            raise TransientBrokerError(
+                "account summary carried no lastTransactionID; cannot bound a reconcile scan"
+            ) from exc
 
     def close_trade(self, trade_id: str, units: str | int = "ALL") -> dict[str, Any]:
         from oandapyV20.endpoints.trades import TradeClose
