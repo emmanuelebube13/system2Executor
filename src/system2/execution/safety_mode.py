@@ -32,6 +32,14 @@ from system2.execution.pipeline import is_in_session
 
 log = get_logger("execution.safety_mode")
 
+# The documented safety posture (RUNBOOK.md, deployment-guide/05 §4): System 3 silent for
+# more than 5 minutes while in-session => PAUSE. Any deployed override is a deviation from
+# the published contract and is alarmed at startup (F-304).
+DOCUMENTED_STALENESS_LIMIT_SEC = 300.0
+# Above this the in-session auto-PAUSE cannot realistically fire inside a trading day, so the
+# ">5 min silence => PAUSE" claim becomes false rather than merely relaxed.
+MAX_SANE_STALENESS_LIMIT_SEC = 3600.0
+
 
 class SafetyState(str, Enum):
     RUNNING = "running"
@@ -51,14 +59,39 @@ class SafetyConfig:
 
     @classmethod
     def from_secrets(cls, secrets: Any) -> "SafetyConfig":
+        limit = float(secrets.get_int("STALENESS_LIMIT_SEC", int(DOCUMENTED_STALENESS_LIMIT_SEC)))
+        cls._alarm_on_staleness_deviation(limit)
         return cls(
-            staleness_limit_sec=float(secrets.get_int("STALENESS_LIMIT_SEC", 300)),
+            staleness_limit_sec=limit,
             hysteresis_sec=float(secrets.get_int("STALENESS_HYSTERESIS_SEC", 30)),
             bypass_enable=secrets.get_bool("EXEC_BYPASS_ENABLE", False),
             bypass_confirm_token=secrets.get("BYPASS_CONFIRM_TOKEN", "") or "",
             bypass_risk_pct=float(secrets.get("BYPASS_RISK_PCT", "0.25") or 0.25),
             bypass_max_positions=secrets.get_int("BYPASS_MAX_POSITIONS", 3),
             bypass_max_duration_sec=float(secrets.get_int("BYPASS_MAX_DURATION_SEC", 3600)),
+        )
+
+    @staticmethod
+    def _alarm_on_staleness_deviation(limit: float) -> None:
+        """Make a deployed staleness override impossible to miss at startup (F-304).
+
+        The value is honoured as configured — silently clamping it would trade one
+        undocumented posture for another — but a deviation from the published 300 s
+        contract is logged, and anything past ``MAX_SANE_STALENESS_LIMIT_SEC`` is logged
+        CRITICAL because at that point the documented auto-PAUSE can no longer fire
+        within a trading day.
+        """
+        if limit == DOCUMENTED_STALENESS_LIMIT_SEC:
+            return
+        level = logging.CRITICAL if limit > MAX_SANE_STALENESS_LIMIT_SEC else logging.WARNING
+        log_event(
+            log, level,
+            "STALENESS_LIMIT_SEC deviates from the documented safety posture",
+            configured_sec=limit,
+            documented_sec=DOCUMENTED_STALENESS_LIMIT_SEC,
+            factor=round(limit / DOCUMENTED_STALENESS_LIMIT_SEC, 1),
+            auto_pause_effective=limit <= MAX_SANE_STALENESS_LIMIT_SEC,
+            finding="F-304",
         )
 
 
@@ -100,9 +133,29 @@ class SafetyMonitor:
             self._started_at = self.clock()
 
     # ----- freshness inputs -------------------------------------------------
-    def record_heartbeat(self, at: datetime | None = None) -> None:
-        """System 3 heartbeat / any well-formed message bumps freshness (silence-by-design)."""
-        self._last_heartbeat_at = (at or self.clock()).astimezone(timezone.utc)
+    def record_heartbeat(self, at: datetime | None = None) -> bool:
+        """Credit a System-3 keepalive as freshness. Returns True iff it was credited.
+
+        Fail-closed (F-305): a heartbeat is evidence that System 3 was alive *at the moment
+        it was produced*, so only the producer timestamp is ever trusted, and it is credited
+        only if it still falls inside the staleness window. A redelivered or replayed
+        keepalive from a dead System 3 is therefore worthless and cannot un-PAUSE the engine.
+        Future-dated stamps are clamped to now (clock skew must not buy extra freshness) and
+        the mark only ever moves forward.
+        """
+        now = self.clock().astimezone(timezone.utc)
+        ts = (at or now).astimezone(timezone.utc)
+        if ts > now:
+            ts = now
+        age = (now - ts).total_seconds()
+        if age > self.config.staleness_limit_sec:
+            log_event(log, logging.WARNING, "stale heartbeat ignored (no freshness credited)",
+                      age_sec=round(age, 1), limit_sec=self.config.staleness_limit_sec)
+            return False
+        if self._last_heartbeat_at is not None and ts <= self._last_heartbeat_at:
+            return False  # replay/out-of-order: the mark never moves backwards
+        self._last_heartbeat_at = ts
+        return True
 
     def _fresh_at(self, last_message_at: datetime | None) -> datetime:
         # Real signal = the most recent order/heartbeat. Only when NOTHING has arrived yet do

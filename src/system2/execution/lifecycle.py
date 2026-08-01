@@ -352,6 +352,7 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
         emit_fn=_emit_fill,
         validate_fn=lambda c: (lambda r: (r.ok, r.reason))(validator.validate(c)),
         submit_gate_fn=monitor.can_submit,
+        heartbeat_fn=monitor.record_heartbeat,  # EXEC-008: S3 keepalive -> freshness (F-305)
         open_instruments_fn=lambda: [t.instrument for t in position_manager.trades.values()
                                      if not t.closed],
         max_age_sec=secrets.get_int("ORDER_MAX_AGE_SEC", 300),
@@ -405,6 +406,7 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
         safety_state_fn=lambda: monitor.state.value,
         model_set_id_fn=_active_model_set_id,
         staleness_fn=lambda: monitor.staleness_seconds(monitor.clock(), consumer.lag.last_message_at),
+        staleness_limit_fn=lambda: monitor.config.staleness_limit_sec,
         last_message_at_fn=lambda: consumer.lag.last_message_at,
         messages_seen_fn=lambda: consumer.lag.messages_seen,
         open_positions_fn=lambda: [{"trade_id": t.broker_trade_id, "instrument": t.instrument}

@@ -3,9 +3,14 @@
 In ``EXEC_MODE=execution_only`` Layer 4 sources work ONLY from the queue (never
 ``Fact_Signals``). The consumer is a session-scoped poller with manual ack:
 
-  pull -> validate envelope -> (malformed -> DLQ+ack) -> (expired/seen -> ack-drop)
+  pull -> (S3 heartbeat -> credit freshness + ack) -> validate envelope
+       -> (malformed -> DLQ+ack) -> (expired/seen -> ack-drop)
        -> (out-of-session -> nack/park) -> pipeline.process (last-line §7.2 gate)
        -> ack iff durably handled, else nack (redeliver).
+
+Queue freshness (the EXEC-008 staleness input) is credited **only after** a message has
+passed its TTL (F-305): an expired redelivery proves the queue is replaying, not that
+System 3 is alive, and must never be able to un-PAUSE the engine.
 
 An order is ack'd only after it is *durably handled* (submitted+recorded, or definitively
 rejected) so a crash mid-processing redelivers rather than loses the order. Dedup is
@@ -31,6 +36,10 @@ from system2.execution.pipeline import ApprovedOrder, Decision, ExecutionPipelin
 from system2.execution.validation import is_expired, validate_envelope
 
 log = get_logger("execution.outbound_consumer")
+
+# System 3 -> System 2 keepalive (deployment-guide/05 §4). Published on the SAME outbound
+# subscription as approved orders; carries freshness only and never becomes an order.
+HEARTBEAT_EVENT_TYPE = "system3.heartbeat"
 
 # Decisions that mean "we are done with this message" -> ack (do NOT redeliver).
 _DURABLE_DECISIONS = frozenset(
@@ -105,6 +114,7 @@ class OutboundConsumer:
     emit_fn: Callable[[ApprovedOrder, Any, Any], None] | None = None
     validate_fn: Callable[[Any], tuple[bool, str]] | None = None
     submit_gate_fn: Callable[[], bool] | None = None  # EXEC-008: park new orders when PAUSED
+    heartbeat_fn: Callable[[datetime | None], bool] | None = None  # EXEC-008: S3 keepalive sink
     open_instruments_fn: Callable[[], Iterable[str]] = field(default=lambda: ())
     max_age_sec: int | None = None
     prefetch: int = 4
@@ -130,8 +140,71 @@ class OutboundConsumer:
             stats[outcome] = stats.get(outcome, 0) + 1
         return stats
 
+    @staticmethod
+    def _parse_ts(raw: dict[str, Any], *fields: str) -> datetime | None:
+        """First parseable ISO timestamp among ``fields``, as UTC. None if there is none."""
+        for field_name in fields:
+            value = raw.get(field_name)
+            if not value:
+                continue
+            try:
+                return datetime.fromisoformat(
+                    str(value).replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _credit_freshness(self, raw: dict[str, Any], now: datetime) -> None:
+        """Mark the queue as fresh. Only ever called once a message has passed its TTL."""
+        self.lag.last_message_at = now
+        created = self._parse_ts(raw, "created_at")
+        if created is not None:
+            self.lag.last_message_created_at = created
+
+    def _handle_heartbeat(self, msg: Any, raw: dict[str, Any]) -> str:
+        """Route a System-3 keepalive to the safety monitor, then ack it.
+
+        The keepalive is credited from its producer ``created_at`` (never wall-clock
+        receipt), and the monitor independently refuses one that is already older than the
+        staleness limit — so a replayed heartbeat cannot resurrect a dark System 3 (F-305).
+        Always ack'd: a heartbeat is worthless on redelivery, so it must never be requeued.
+
+        Deliberately does NOT bump ``lag.messages_seen``: that counter means "approved
+        orders have reached System 2", and a keepalive must never make a dead order path
+        look alive on the telemetry surface.
+
+        ``produced_at`` is accepted alongside ``created_at`` because System 3's envelope
+        builder stamps the former (``ams/common/queue_backend.py:56``) while System 2's
+        order envelope uses the latter.
+        """
+        sent_at = self._parse_ts(raw, "created_at", "produced_at")
+        credited = False
+        if sent_at is None:
+            # Fail closed: an undated keepalive cannot be shown to be recent, so it buys
+            # no freshness. Crediting `now` here would let any replay resume the engine.
+            log_event(log, logging.WARNING, "heartbeat without a usable timestamp ignored",
+                      source=(raw.get("payload") or {}).get("source"))
+        elif self.heartbeat_fn is not None:
+            try:
+                credited = bool(self.heartbeat_fn(sent_at))
+            except Exception as exc:  # a bad keepalive must never break the poll loop
+                log_event(log, logging.ERROR, "heartbeat handling failed", error=str(exc),
+                          source=(raw.get("payload") or {}).get("source"))
+        log_event(log, logging.DEBUG if credited else logging.INFO,
+                  "system3 heartbeat received", credited=credited,
+                  sent_at=sent_at.isoformat().replace("+00:00", "Z") if sent_at else None)
+        msg.ack()
+        return "heartbeat" if credited else "heartbeat_stale"
+
     def _handle(self, msg: Any, now: datetime) -> str:
         raw = msg.body
+        # --- System-3 keepalive (EXEC-008/F-305): freshness only, never an order ---
+        # Routed before envelope validation because a heartbeat carries no order fields and
+        # would otherwise be dead-lettered as malformed.
+        if isinstance(raw, dict) and raw.get("event_type") == HEARTBEAT_EVENT_TYPE:
+            return self._handle_heartbeat(msg, raw)
+
         # --- envelope validation: malformed -> dead-letter + ack (no poison loop) ---
         res = validate_envelope(raw)
         if not res.ok:
@@ -145,24 +218,20 @@ class OutboundConsumer:
                 return "dlq_error"
             return "dead_lettered"
 
-        # well-formed -> update lag from this message
         self.lag.messages_seen += 1
-        self.lag.last_message_at = now
-        created = raw.get("created_at")
-        if created:
-            try:
-                self.lag.last_message_created_at = datetime.fromisoformat(
-                    created.replace("Z", "+00:00")
-                ).astimezone(timezone.utc)
-            except ValueError:
-                pass
 
         # --- TTL: stale order -> ack-drop (never submit a stale order) ---
+        # NOTE (F-305): this check runs BEFORE any freshness is credited. An expired
+        # redelivery is evidence of a replaying queue, not of a live System 3, so it must
+        # not be able to un-PAUSE the engine.
         if is_expired(raw, now, self.max_age_sec):
             log_event(log, logging.WARNING, "expired order dropped",
                       idempotency_key=raw.get("idempotency_key"))
             msg.ack()
             return "expired"
+
+        # well-formed AND within TTL -> this message is real evidence System 3 is alive
+        self._credit_freshness(raw, now)
 
         order = ApprovedOrder.from_dict(raw)
 

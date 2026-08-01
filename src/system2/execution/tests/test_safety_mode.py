@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -142,3 +144,105 @@ def test_transition_alerts_fire():
     m.alert_fn = lambda **kw: alerts.append(kw)
     m.evaluate(WED - timedelta(seconds=400), now=WED)  # -> PAUSED
     assert alerts and alerts[-1]["to_state"] == "paused"
+
+
+# ----- F-305: the heartbeat must be safe to trust ---------------------------------
+def test_stale_heartbeat_is_not_credited():
+    """A replayed keepalive older than the limit proves nothing and must not resume."""
+    m, h = _mon(WED, staleness_limit_sec=300)
+    m._started_at = WED - timedelta(seconds=1000)
+    assert m.evaluate(None, now=WED) is SafetyState.PAUSED
+    assert m.record_heartbeat(WED - timedelta(seconds=900)) is False
+    assert m.evaluate(None, now=WED) is SafetyState.PAUSED
+    assert m.can_submit() is False
+
+
+def test_future_dated_heartbeat_is_clamped_to_now():
+    """Clock skew (or a forged stamp) must not buy freshness beyond the present."""
+    m, h = _mon(WED, staleness_limit_sec=300)
+    assert m.record_heartbeat(WED + timedelta(hours=5)) is True
+    assert m.staleness_seconds(WED, None) == 0.0
+    assert m._last_heartbeat_at == WED
+
+
+def test_heartbeat_mark_never_moves_backwards():
+    m, h = _mon(WED, staleness_limit_sec=300)
+    assert m.record_heartbeat(WED - timedelta(seconds=10)) is True
+    assert m.record_heartbeat(WED - timedelta(seconds=200)) is False  # out-of-order replay
+    assert m.staleness_seconds(WED, None) == 10.0
+
+
+def test_fresh_heartbeat_resumes_a_paused_engine():
+    """The keepalive is the ONLY evidence that legitimately un-PAUSEs a dark System 3."""
+    m, h = _mon(WED, staleness_limit_sec=300, hysteresis_sec=30)
+    m._started_at = WED - timedelta(seconds=1000)
+    assert m.evaluate(None, now=WED) is SafetyState.PAUSED
+    assert m.record_heartbeat(WED - timedelta(seconds=5)) is True
+    assert m.evaluate(None, now=WED) is SafetyState.RUNNING
+    assert m.can_submit() is True
+
+
+# ----- F-304: a deployed staleness override must be loudly visible ----------------
+def _fake_secrets(values: dict):
+    class _S:
+        def get(self, n, d=None):
+            return values.get(n, d)
+
+        def get_int(self, n, d):
+            return int(values.get(n, d))
+
+        def get_bool(self, n, d=False):
+            return bool(values.get(n, d))
+
+    return _S()
+
+
+@contextmanager
+def _capture_safety_logs():
+    """Collect records off the safety logger directly.
+
+    The ``system2`` logger sets ``propagate=False`` and binds its StreamHandler at import
+    time, so neither ``caplog`` nor ``capfd`` observes it — attach a handler instead.
+    """
+    records: list[logging.LogRecord] = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger("system2.execution.safety_mode")
+    handler = _Collector(level=logging.DEBUG)
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_staleness_limit_deviation_is_alarmed():
+    with _capture_safety_logs() as records:
+        cfg = SafetyConfig.from_secrets(_fake_secrets({"STALENESS_LIMIT_SEC": 86400}))
+    assert cfg.staleness_limit_sec == 86400.0  # honoured, not silently clamped
+    hits = [r for r in records if "STALENESS_LIMIT_SEC deviates" in r.getMessage()]
+    assert len(hits) == 1
+    assert hits[0].levelno == logging.CRITICAL  # 24h => auto-PAUSE can never fire
+    assert hits[0].context["factor"] == 288.0
+    assert hits[0].context["auto_pause_effective"] is False
+
+
+def test_moderate_staleness_deviation_warns_but_is_not_critical():
+    with _capture_safety_logs() as records:
+        SafetyConfig.from_secrets(_fake_secrets({"STALENESS_LIMIT_SEC": 600}))
+    hits = [r for r in records if "STALENESS_LIMIT_SEC deviates" in r.getMessage()]
+    assert len(hits) == 1 and hits[0].levelno == logging.WARNING
+
+
+def test_documented_staleness_limit_is_not_alarmed():
+    with _capture_safety_logs() as records:
+        cfg = SafetyConfig.from_secrets(_fake_secrets({"STALENESS_LIMIT_SEC": 300}))
+    assert cfg.staleness_limit_sec == 300.0
+    assert not [r for r in records if "deviates" in r.getMessage()]
+
+
+def test_staleness_limit_defaults_to_the_documented_300():
+    assert SafetyConfig.from_secrets(_fake_secrets({})).staleness_limit_sec == 300.0
