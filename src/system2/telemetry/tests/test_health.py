@@ -144,3 +144,42 @@ def test_status_exposes_the_effective_staleness_limit():
 def test_staleness_limit_degrades_to_none_when_unwired():
     s = _reporter().status()
     assert s["queue"]["staleness_limit_sec"] is None
+
+
+# ----- FIX_PLAN 2.1(d): gatekeeper approval-rate band on /status -------------------
+def test_status_carries_the_gatekeeper_approval_band():
+    """Exposed for the same reason as `queue.staleness_limit_sec` (F-304): the
+    EFFECTIVE safety posture must be auditable without shell access to the box."""
+    snap = {
+        "state": "out_of_band", "alarm": True,
+        "reason": "approval rate 0.9995 ... is ABOVE the declared turnover band",
+        "approval_rate": 0.9995, "band": [0.05, 0.6],
+        "evaluations": 200, "window": 200, "enforcing": False,
+        "ci99": [0.968, 1.0], "lifetime_evaluations": 1894,
+    }
+    gk = _reporter(gatekeeper_approval_fn=lambda: snap).status()["gatekeeper"]
+    assert gk["alarm"] is True
+    assert gk["state"] == "out_of_band"
+    assert gk["approval_rate"] == 0.9995
+    assert gk["band"] == [0.05, 0.6]
+    assert gk["enforcing"] is False
+    assert "ABOVE" in gk["reason"]
+
+
+def test_gatekeeper_block_reports_unavailable_rather_than_looking_healthy():
+    """No provider wired must read as "not measured", never as an implicit all-clear —
+    an absent number is exactly how the 0.9995 approval rate stayed invisible."""
+    for reporter in (_reporter(), _reporter(gatekeeper_approval_fn=lambda: None),
+                     _reporter(gatekeeper_approval_fn=lambda: "nonsense")):
+        gk = reporter.status()["gatekeeper"]
+        assert gk["state"] == "unavailable"
+        assert gk["alarm"] is False
+
+
+def test_gatekeeper_provider_raising_degrades_not_crashes():
+    def boom():
+        raise RuntimeError("monitor down")
+
+    s = _reporter(gatekeeper_approval_fn=boom).status()
+    assert s["gatekeeper"]["state"] == "unavailable"
+    assert s["service"] == "system-2-execution-engine"   # rest of /status intact
