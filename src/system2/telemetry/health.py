@@ -40,6 +40,7 @@ class HealthReporter:
 
     safety_state_fn: Callable[[], str] | None = None
     staleness_fn: Callable[[], float | None] | None = None
+    staleness_limit_fn: Callable[[], float | None] | None = None
     last_message_at_fn: Callable[[], datetime | None] | None = None
     messages_seen_fn: Callable[[], int] | None = None
     open_positions_fn: Callable[[], list[dict[str, Any]]] | None = None
@@ -91,6 +92,7 @@ class HealthReporter:
             "schema_version": SCHEMA_VERSION,
             "exec_mode": (self._safe(self.safety_state_fn, "unknown") or "unknown").upper(),
             "queue_staleness_sec": self._safe(self.staleness_fn),
+            "queue_staleness_limit_sec": self._safe(self.staleness_limit_fn),
             "open_positions": len(positions),
             "broker_env": self._safe(self.broker_env_fn, "unknown"),
             "model_set_id": self._safe(self.model_set_id_fn),
@@ -111,6 +113,9 @@ class HealthReporter:
             "exec_mode": (self._safe(self.safety_state_fn, "unknown") or "unknown").upper(),
             "queue": {
                 "staleness_sec": self._safe(self.staleness_fn),
+                # The EFFECTIVE limit this process is running with. Exposed so the deployed
+                # safety posture can be audited without shell access to the box (F-304).
+                "staleness_limit_sec": self._safe(self.staleness_limit_fn),
                 "last_message_at": _utc_iso(self._safe(self.last_message_at_fn)),
                 "messages_seen": self._safe(self.messages_seen_fn, 0),
             },

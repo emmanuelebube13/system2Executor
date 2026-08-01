@@ -180,3 +180,98 @@ def test_last_line_validation_rejects(queue, tmp_path):
     assert stats.get("rejected_validation") == 1
     assert len(submits) == 0
     assert queue.pull(SUB) == []  # ack'd (definitive rejection, not redelivered)
+
+
+# ----- F-305: freshness is credited only by evidence System 3 is alive ------------
+def _heartbeat_msg(created_at: str = "2026-06-24T11:59:30Z", **over) -> dict:
+    payload = {
+        "schema_version": "1",
+        "message_id": "hb-1",
+        "idempotency_key": "hb-1",
+        "correlation_id": "c-hb",
+        "created_at": created_at,
+        "event_type": "system3.heartbeat",
+        "payload": {"source": "system3.ams", "state": "enforce"},
+    }
+    payload.update(over)
+    return payload
+
+
+def test_expired_order_does_not_credit_freshness(queue, tmp_path):
+    """F-305: an expired redelivery must not look like a live System 3."""
+    consumer, _ = _consumer(queue, tmp_path)
+    consumer.max_age_sec = 300
+    queue.publish(SUB, _order_msg(expires_at="2026-06-24T11:00:00Z"))
+    stats = consumer.poll_once()
+    assert stats.get("expired") == 1
+    assert consumer.lag.last_message_at is None  # no freshness credited
+    assert consumer.lag.seconds_since_last_message(WED) is None
+
+
+def test_heartbeat_credits_freshness_and_is_not_dead_lettered(queue, tmp_path):
+    seen: list = []
+    consumer, _ = _consumer(queue, tmp_path)
+    consumer.heartbeat_fn = lambda at: (seen.append(at) or True)
+    queue.publish(SUB, _heartbeat_msg())
+    stats = consumer.poll_once()
+    assert stats.get("heartbeat") == 1
+    assert queue.depth(f"{SUB}.dlq", "ready") == 0  # NOT malformed
+    assert queue.pull(SUB) == []  # ack'd, never redelivered
+    assert seen and seen[0] == datetime(2026, 6, 24, 11, 59, 30, tzinfo=timezone.utc)
+
+
+def test_heartbeat_does_not_inflate_messages_seen(queue, tmp_path):
+    """A keepalive must never make a dead order path look alive."""
+    consumer, _ = _consumer(queue, tmp_path)
+    consumer.heartbeat_fn = lambda at: True
+    queue.publish(SUB, _heartbeat_msg())
+    consumer.poll_once()
+    assert consumer.lag.messages_seen == 0
+
+
+def test_rejected_heartbeat_is_still_acked(queue, tmp_path):
+    """The monitor refused it (too old) — it is worthless, so it must not be requeued."""
+    consumer, _ = _consumer(queue, tmp_path)
+    consumer.heartbeat_fn = lambda at: False
+    queue.publish(SUB, _heartbeat_msg(created_at="2026-06-24T09:00:00Z"))
+    stats = consumer.poll_once()
+    assert stats.get("heartbeat_stale") == 1
+    assert queue.pull(SUB) == []
+
+
+def test_heartbeat_failure_never_breaks_the_poll_loop(queue, tmp_path):
+    def _boom(at):
+        raise RuntimeError("monitor exploded")
+
+    consumer, _ = _consumer(queue, tmp_path)
+    consumer.heartbeat_fn = _boom
+    queue.publish(SUB, _heartbeat_msg())
+    stats = consumer.poll_once()  # must not raise
+    assert stats.get("heartbeat_stale") == 1
+
+
+def test_heartbeat_accepts_system3_produced_at_field(queue, tmp_path):
+    """System 3's envelope builder stamps `produced_at`, not `created_at`."""
+    seen: list = []
+    consumer, _ = _consumer(queue, tmp_path)
+    consumer.heartbeat_fn = lambda at: (seen.append(at) or True)
+    hb = _heartbeat_msg()
+    del hb["created_at"]
+    hb["produced_at"] = "2026-06-24T11:59:30Z"
+    queue.publish(SUB, hb)
+    assert consumer.poll_once().get("heartbeat") == 1
+    assert seen[0] == datetime(2026, 6, 24, 11, 59, 30, tzinfo=timezone.utc)
+
+
+def test_undated_heartbeat_is_refused(queue, tmp_path):
+    """Fail closed: an undated keepalive cannot be shown to be recent, so it buys nothing."""
+    calls: list = []
+    consumer, _ = _consumer(queue, tmp_path)
+    consumer.heartbeat_fn = lambda at: (calls.append(at) or True)
+    hb = _heartbeat_msg()
+    del hb["created_at"]
+    queue.publish(SUB, hb)
+    stats = consumer.poll_once()
+    assert stats.get("heartbeat_stale") == 1
+    assert calls == []  # the monitor was never even asked
+    assert queue.pull(SUB) == []  # still ack'd, never a poison loop

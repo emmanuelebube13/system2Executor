@@ -131,3 +131,16 @@ def test_http_responses_carry_no_secrets(client):
     blob = (client.get("/status").text + client.get("/api/account/state").text).lower()
     for banned in ("api_key", "password", "secret", "token", "access_token"):
         assert banned not in blob
+
+
+# ----- F-304: the effective staleness limit must be auditable remotely -------------
+def test_status_exposes_the_effective_staleness_limit():
+    """The deployed limit is the safety posture; it must be visible without shell access."""
+    r = _reporter(staleness_limit_fn=lambda: 300.0)
+    assert r.status()["queue"]["staleness_limit_sec"] == 300.0
+    assert r.account_state()["queue_staleness_limit_sec"] == 300.0
+
+
+def test_staleness_limit_degrades_to_none_when_unwired():
+    s = _reporter().status()
+    assert s["queue"]["staleness_limit_sec"] is None
