@@ -325,10 +325,13 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
     )
     validator = OrderValidator.from_secrets(secrets)
 
-    def _price_fn(order: Any) -> float:
-        # expected/reference entry price; broker fill is the source of truth (EXEC-006).
-        sug = order.risk_context.suggested_sl
-        return float(sug) if sug is not None else float(order.risk_context.atr)
+    # F-306: the entry reference now comes from the BROKER's book (adapter.price_fn), not from
+    # the order. What stood here returned `suggested_sl or atr` — the STOP price, or a raw ATR
+    # (a distance) masquerading as a price. Since the bridge always populates suggested_sl,
+    # production's "entry price" was literally the stop price, so entry == SL; and on the
+    # fallback path SL = atr - 1.0*atr = 0.0, which is the SL=0.0 the audit harness reproduced.
+    # adapter.price_fn returns None when there is no usable quote, and the pipeline REFUSES
+    # rather than substituting a stand-in. Do not reintroduce a fallback here.
 
     def _emit_fill(order: Any, constructed: Any, fill: Any) -> None:
         # publish the entry fill FIRST (unchanged EXEC-005 path), then register the trade
@@ -346,7 +349,7 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
         queue=queue,
         subscription=secrets.require("OUTBOUND_QUEUE_NAME"),
         pipeline=pipeline,
-        price_fn=_price_fn,
+        price_fn=adapter.price_fn,
         submit_fn=adapter.submit,
         persist_fn=persist_fn,
         emit_fn=_emit_fill,

@@ -20,10 +20,12 @@ T0 = datetime(2026, 6, 24, 12, 0, 0, tzinfo=timezone.utc)
 class FakeAdapter:
     def __init__(self):
         self.modified = []
+        self.instruments = []
         self.closed = []
 
-    def modify_stop(self, trade_id, new_stop):
+    def modify_stop(self, trade_id, new_stop, instrument=None):
         self.modified.append((trade_id, new_stop))
+        self.instruments.append(instrument)
         return {"ok": True}
 
     def close_trade(self, trade_id, units="ALL"):
@@ -91,6 +93,15 @@ def test_breakeven_moves_stop_to_entry_once():
     acts2 = mgr.on_tick(trade, 1.10120)
     assert "breakeven" not in acts2
     assert len(adapter.modified) == 1
+
+
+def test_stop_moves_carry_the_instrument_for_price_precision():
+    """F-308: without the instrument the adapter cannot render the price at the right
+    precision, and a JPY stop-move (breakeven/trailing) is rejected by the broker."""
+    adapter = FakeAdapter()
+    mgr = _mgr(adapter, [T0], breakeven_buffer_pips=1.0)
+    mgr.on_tick(_long(), 1.10100)
+    assert adapter.instruments == ["EUR_USD"]
 
 
 def test_breakeven_not_triggered_below_1r():

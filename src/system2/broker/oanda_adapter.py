@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Callable, Protocol, runtime_checkable
 
 from system2.common.logging import get_logger, log_event
 from system2.common.secrets import Secrets, get_secrets
 from system2.execution.fill_producer import FillResult
-from system2.execution.pipeline import ConstructedOrder
+from system2.execution.pipeline import ConstructedOrder, InvalidOrderError, assert_protective_prices
 
 log = get_logger("broker.oanda_adapter")
 
@@ -38,6 +40,18 @@ CLIENT_ID_PREFIX = "sb-"
 DEFAULT_SLIPPAGE_TOLERANCE_PIPS = 2.0
 JPY_PIP = 0.01
 STD_PIP = 0.0001
+
+# F-308: OANDA rejects an order price carrying more decimals than the instrument's
+# ``displayPrecision``. These are the *fallbacks* used when the broker's instrument spec
+# cannot be read; they were verified against the live practice
+# ``/v3/accounts/{id}/instruments`` spec for the entire deployed allowlist
+# (audit/harness/teamC_oanda_practice_readonly.py): USD_JPY → 3, and EUR_USD / GBP_USD /
+# AUD_USD / USD_CAD → 5. The authoritative value is still fetched per instrument below.
+JPY_DISPLAY_PRECISION = 3
+STD_DISPLAY_PRECISION = 5
+
+# A reference price older than this is not a price. Fail-closed: the caller refuses to build.
+DEFAULT_PRICE_MAX_AGE_SEC = 60.0
 
 
 # --------------------------------------------------------------------------- #
@@ -74,6 +88,82 @@ def compute_slippage_pips(expected_price: float, fill_price: float, instrument: 
 
 def client_order_id(idempotency_key: str) -> str:
     return f"{CLIENT_ID_PREFIX}{idempotency_key}"
+
+
+# --------------------------------------------------------------------------- #
+# Instrument price precision + price formatting (F-308) — pure, unit-tested
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class InstrumentSpec:
+    """The subset of OANDA's instrument spec that the order path depends on."""
+
+    name: str
+    display_precision: int
+    pip_location: int
+
+    @classmethod
+    def from_broker_row(cls, row: dict[str, Any]) -> "InstrumentSpec":
+        return cls(
+            name=str(row["name"]),
+            display_precision=int(row["displayPrecision"]),
+            pip_location=int(row["pipLocation"]),
+        )
+
+
+def default_display_precision(instrument: str) -> int:
+    """Fallback price precision for ``instrument`` when the broker spec is unavailable."""
+    return JPY_DISPLAY_PRECISION if (instrument or "").upper().endswith("_JPY") else STD_DISPLAY_PRECISION
+
+
+def quantize_price(
+    price: float | Decimal,
+    instrument: str,
+    display_precision: int | None = None,
+    *,
+    toward: float | Decimal | None = None,
+) -> Decimal:
+    """Snap ``price`` onto the instrument's price grid, in ``Decimal`` (never binary float).
+
+    ``toward`` is the entry/reference price. When given, the rounding is directional —
+    always **toward** the reference — so quantizing a protective price can only ever make
+    it tighter, never wider: a rounded stop-loss cannot silently add up to a tick of risk,
+    and a rounded take-profit cannot silently move further away. Without ``toward`` this is
+    plain nearest-tick (ROUND_HALF_UP).
+    """
+    decimals = display_precision if display_precision is not None else default_display_precision(instrument)
+    if decimals < 0:
+        raise ValueError(f"{instrument}: negative display precision {decimals}")
+    try:
+        value = price if isinstance(price, Decimal) else Decimal(str(price))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{instrument}: {price!r} is not a price") from exc
+    if not value.is_finite():
+        raise ValueError(f"{instrument}: price {price!r} is not finite")
+
+    rounding = ROUND_HALF_UP
+    if toward is not None:
+        reference = toward if isinstance(toward, Decimal) else Decimal(str(toward))
+        if value > reference:
+            rounding = ROUND_FLOOR      # above the reference → down, i.e. toward it
+        elif value < reference:
+            rounding = ROUND_CEILING    # below the reference → up, i.e. toward it
+    return value.quantize(Decimal(1).scaleb(-decimals), rounding=rounding)
+
+
+def format_price(
+    price: float | Decimal,
+    instrument: str,
+    display_precision: int | None = None,
+    *,
+    toward: float | Decimal | None = None,
+) -> str:
+    """Render ``price`` as OANDA expects it: fixed-point at the instrument's precision.
+
+    F-308: this replaces a hardcoded ``f"{price:.5f}"``. USD_JPY has
+    ``displayPrecision=3``, so every JPY stop/target the engine has ever built carried two
+    illegal decimals (``"153.42718"``) and would be rejected by the v20 API.
+    """
+    return f"{quantize_price(price, instrument, display_precision, toward=toward):f}"
 
 
 # --------------------------------------------------------------------------- #
@@ -125,9 +215,96 @@ class OandaTransport(Protocol):
     def create_order(self, payload: dict[str, Any]) -> dict[str, Any]: ...
     def get_open_trades(self) -> list[dict[str, Any]]: ...
     def get_trade(self, trade_id: str) -> dict[str, Any] | None: ...
-    def modify_trade_stop(self, trade_id: str, stop_price: float) -> dict[str, Any]: ...
+    def modify_trade_stop(
+        self, trade_id: str, stop_price: float, instrument: str | None = None
+    ) -> dict[str, Any]: ...
     def close_trade(self, trade_id: str, units: str | int = "ALL") -> dict[str, Any]: ...
     def get_account_summary(self) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class OandaPricingTransport(Protocol):
+    """The read-only market-data half of the seam (F-306/F-308).
+
+    Deliberately **separate** from ``OandaTransport`` so existing transports/doubles stay
+    conformant; the adapter feature-detects these two methods and degrades safely (no
+    price ⇒ the pipeline refuses to construct; no spec ⇒ the verified per-instrument
+    precision fallback).
+    """
+
+    def get_pricing(self, instruments: list[str]) -> list[dict[str, Any]]: ...
+    def get_account_instruments(self, instruments: list[str] | None = None) -> list[dict[str, Any]]: ...
+
+
+# --------------------------------------------------------------------------- #
+# Market reference price (F-306)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ReferencePrice:
+    """A tradeable two-sided quote — the expected-entry reference for a market order."""
+
+    instrument: str
+    bid: float
+    ask: float
+    time: datetime | None = None
+
+    @property
+    def mid(self) -> float:
+        return (self.bid + self.ask) / 2.0
+
+    def for_side(self, side: str) -> float:
+        """The side of the book the order will actually cross: BUY pays the ask."""
+        return self.ask if str(side).upper() == "BUY" else self.bid
+
+    def age_sec(self, now: datetime | None = None) -> float | None:
+        if self.time is None:
+            return None
+        now = now or datetime.now(timezone.utc)
+        return (now.astimezone(timezone.utc) - self.time.astimezone(timezone.utc)).total_seconds()
+
+
+def _parse_broker_time(raw: Any) -> datetime | None:
+    """RFC3339 as OANDA emits it (up to 9 fractional digits — more than ``fromisoformat``)."""
+    if not raw:
+        return None
+    text = str(raw).strip().replace("Z", "+00:00")
+    if "." in text:
+        head, _, tail = text.partition(".")
+        cut = min((i for i in (tail.find("+"), tail.find("-")) if i != -1), default=len(tail))
+        fraction, offset = tail[:cut], tail[cut:]
+        text = f"{head}.{(fraction[:6] or '0')}{offset}"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def reference_price_from_broker_row(row: dict[str, Any]) -> ReferencePrice | None:
+    """Build a ``ReferencePrice`` from one ``/v3/accounts/{id}/pricing`` row.
+
+    Returns ``None`` — meaning *no price*, so the caller must refuse — when the instrument
+    is halted/untradeable or either side of the book is empty. Never invents a side.
+    """
+    if not row:
+        return None
+    if str(row.get("status", "tradeable")).lower() != "tradeable":
+        return None
+    if row.get("tradeable") is False:
+        return None
+    try:
+        bid = float((row.get("bids") or [{}])[0]["price"])
+        ask = float((row.get("asks") or [{}])[0]["price"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    if not (bid > 0 and ask > 0):
+        return None
+    return ReferencePrice(
+        instrument=str(row.get("instrument", "")),
+        bid=bid,
+        ask=ask,
+        time=_parse_broker_time(row.get("time")),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -146,10 +323,19 @@ class OandaAdapter:
         retry_max: int | None = None,
         backoff_sec: float | None = None,
         sleep_fn: Callable[[float], None] | None = None,
+        price_max_age_sec: float | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.transport = transport
         self.secrets = secrets or get_secrets()
         self.env = environment or resolve_environment(self.secrets)
+        self.price_max_age_sec = (
+            price_max_age_sec
+            if price_max_age_sec is not None
+            else float(self.secrets.get_int("PRICE_MAX_AGE_SEC", int(DEFAULT_PRICE_MAX_AGE_SEC)))
+        )
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._specs: dict[str, InstrumentSpec] = {}
         self.slippage_tolerance_pips = (
             slippage_tolerance_pips
             if slippage_tolerance_pips is not None
@@ -164,9 +350,97 @@ class OandaAdapter:
         self._sleep = sleep_fn or _time.sleep
         log_event(log, logging.INFO, self.env.banner(), env=self.env.env)
 
+    # ----- instrument spec / price precision (F-308) ------------------------
+    def instrument_spec(self, instrument: str) -> InstrumentSpec | None:
+        """The broker's spec for ``instrument``, cached for the process. ``None`` if unknown.
+
+        Transport failures are **not** cached — a spec lookup that fails now must be retried
+        on the next order rather than pinning a fallback precision for the whole process.
+        """
+        key = (instrument or "").upper()
+        if key in self._specs:
+            return self._specs[key]
+        fetch = getattr(self.transport, "get_account_instruments", None)
+        if fetch is None:
+            return None
+        try:
+            rows = fetch([key]) or []
+        except Exception as exc:  # noqa: BLE001 — degrade to the verified fallback, loudly
+            log_event(log, logging.WARNING, "instrument spec lookup failed; using default precision",
+                      instrument=key, error=str(exc))
+            return None
+        for row in rows:
+            try:
+                spec = InstrumentSpec.from_broker_row(row)
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._specs[spec.name.upper()] = spec
+        return self._specs.get(key)
+
+    def display_precision(self, instrument: str) -> int:
+        spec = self.instrument_spec(instrument)
+        if spec is not None:
+            return spec.display_precision
+        return default_display_precision(instrument)
+
+    # ----- market reference price (F-306) -----------------------------------
+    def reference_price(self, instrument: str, side: str) -> float | None:
+        """The price a market order of ``side`` would actually cross, or ``None``.
+
+        ``None`` means *there is no usable price right now* — the transport has no pricing
+        capability, the call failed, the instrument is halted, or the quote is staler than
+        ``price_max_age_sec``. The caller MUST refuse to construct an order on ``None``
+        (``pipeline.require_market_price``); it must never substitute the stop price, the
+        ATR, or any other stand-in. That substitution is exactly what F-306 was.
+        """
+        fetch = getattr(self.transport, "get_pricing", None)
+        if fetch is None:
+            log_event(log, logging.ERROR, "transport has no pricing capability; no reference price",
+                      instrument=instrument)
+            return None
+        try:
+            rows = fetch([instrument]) or []
+        except Exception as exc:  # noqa: BLE001 — no price is a reject, not a crash
+            log_event(log, logging.ERROR, "pricing lookup failed; no reference price",
+                      instrument=instrument, error=str(exc))
+            return None
+        for row in rows:
+            quote = reference_price_from_broker_row(row)
+            if quote is None or quote.instrument.upper() not in ("", instrument.upper()):
+                continue
+            age = quote.age_sec(self._clock())
+            if age is not None and age > self.price_max_age_sec:
+                log_event(log, logging.ERROR, "reference price too stale; refusing to price the order",
+                          instrument=instrument, age_sec=round(age, 3),
+                          max_age_sec=self.price_max_age_sec)
+                return None
+            return quote.for_side(side)
+        log_event(log, logging.ERROR, "no tradeable quote returned; no reference price",
+                  instrument=instrument)
+        return None
+
+    def price_fn(self, order: Any) -> float | None:
+        """Drop-in ``OutboundConsumer.price_fn``: a REAL market price, or ``None`` to reject.
+
+        This is the intended replacement for ``lifecycle.build_from_secrets._price_fn``,
+        which returned ``suggested_sl or atr`` — the stop price, or a raw ATR pretending to
+        be a price (F-306).
+        """
+        return self.reference_price(order.instrument, order.side)
+
     # ----- order payload ----------------------------------------------------
     def _build_payload(self, order: ConstructedOrder) -> dict[str, Any]:
         cid = client_order_id(order.idempotency_key)
+        decimals = self.display_precision(order.instrument)
+        # Directional quantization (``toward=entry``) guarantees the tick-snap can only
+        # tighten a protective price, never widen the stop.
+        stop_loss = quantize_price(order.stop_loss, order.instrument, decimals, toward=order.entry_price)
+        take_profit = quantize_price(order.take_profit, order.instrument, decimals, toward=order.entry_price)
+        # Last line before the wire: the invariant that survives rounding (F-306).
+        assert_protective_prices(
+            order.instrument, 1 if str(order.side).upper() == "BUY" else -1,
+            order.entry_price, float(stop_loss), float(take_profit),
+        )
         return {
             "order": {
                 "type": "MARKET",
@@ -176,8 +450,8 @@ class OandaAdapter:
                 "positionFill": "DEFAULT",
                 "clientExtensions": {"id": cid},
                 "tradeClientExtensions": {"id": cid},
-                "stopLossOnFill": {"price": f"{order.stop_loss:.5f}"},
-                "takeProfitOnFill": {"price": f"{order.take_profit:.5f}"},
+                "stopLossOnFill": {"price": f"{stop_loss:f}"},
+                "takeProfitOnFill": {"price": f"{take_profit:f}"},
             }
         }
 
@@ -338,9 +612,10 @@ class OandaAdapter:
         tp_price = float(tp["price"]) if tp and tp.get("price") else None
 
         if sl_price is None:
-            # attempt to attach the intended stop
+            # attempt to attach the intended stop (F-308: the repair path must respect the
+            # instrument's price precision too, or a JPY position stays unprotected)
             try:
-                self.transport.modify_trade_stop(trade_id, order.stop_loss)
+                self.transport.modify_trade_stop(trade_id, order.stop_loss, order.instrument)
                 sl_price = order.stop_loss
             except BrokerError:
                 return None, tp_price, True  # unsafe: could not confirm or attach a stop
@@ -366,9 +641,17 @@ class OandaAdapter:
         )
 
     # ----- position-management helpers (used by EXEC-007) -------------------
-    def modify_stop(self, trade_id: str, new_stop_price: float) -> dict[str, Any]:
-        """Idempotent stop modification (routed here so EXEC-007 stays broker-agnostic)."""
-        return self.transport.modify_trade_stop(trade_id, new_stop_price)
+    def modify_stop(self, trade_id: str, new_stop_price: float, instrument: str) -> dict[str, Any]:
+        """Idempotent stop modification (routed here so EXEC-007 stays broker-agnostic).
+
+        ``instrument`` is required: without it the price cannot be rendered at the right
+        precision and a JPY stop-move is rejected by the broker (F-308).
+        """
+        if new_stop_price is None or not float(new_stop_price) > 0:
+            raise InvalidOrderError(
+                f"{instrument}: refusing to move trade {trade_id} stop to {new_stop_price!r}"
+            )
+        return self.transport.modify_trade_stop(trade_id, new_stop_price, instrument)
 
     def close_trade(self, trade_id: str, units: str | int = "ALL") -> dict[str, Any]:
         return self.transport.close_trade(trade_id, units)
