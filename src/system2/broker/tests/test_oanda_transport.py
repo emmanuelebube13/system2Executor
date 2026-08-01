@@ -66,3 +66,34 @@ def test_pricing_and_instrument_endpoints_are_read_only_and_shaped_right(transpo
     assert transport.get_account_instruments(["USD_JPY"]) == [{"name": "EUR_USD"}]
     assert cap.requests[1].params == {"instruments": "USD_JPY"}
     assert cap.requests[1].method == "GET"
+
+
+# ----- F-303: the bounded transaction reader behind the pre-submit reconcile -------
+def test_recent_transactions_is_bounded_and_ends_at_the_live_head(transport):
+    cap = _stub(transport, {"lastTransactionID": "2608", "account": {"id": "x"},
+                            "transactions": [{"id": "2600", "type": "ORDER_FILL"}]})
+    assert transport.get_recent_transactions(200) == [{"id": "2600", "type": "ORDER_FILL"}]
+    # two read-only GETs: the account head, then ONE id-range page ending at it
+    assert [r.method for r in cap.requests] == ["GET", "GET"]
+    assert cap.requests[1].params == {"from": "2409", "to": "2608"}
+
+
+def test_recent_transactions_never_exceeds_the_brokers_idrange_cap(transport):
+    cap = _stub(transport, {"lastTransactionID": "9000", "transactions": []})
+    transport.get_recent_transactions(5000)
+    assert cap.requests[1].params == {"from": "8001", "to": "9000"}  # clamped to 1000
+
+
+def test_recent_transactions_clamps_the_lower_bound_on_a_young_account(transport):
+    cap = _stub(transport, {"lastTransactionID": "12", "transactions": []})
+    transport.get_recent_transactions(200)
+    assert cap.requests[1].params == {"from": "1", "to": "12"}
+
+
+def test_recent_transactions_raises_rather_than_reporting_an_empty_history(transport):
+    """An unreadable head must never look like "verified: no such transaction" (F-303)."""
+    from system2.broker.oanda_adapter import TransientBrokerError
+
+    _stub(transport, {"account": {"id": "x"}})  # no lastTransactionID anywhere
+    with pytest.raises(TransientBrokerError):
+        transport.get_recent_transactions(200)

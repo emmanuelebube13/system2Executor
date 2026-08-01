@@ -4,9 +4,13 @@ Turns a deterministic ``ConstructedOrder`` (already-sized ``units`` from System 
 re-sized here) into a real OANDA fill and reports the authoritative outcome as a
 ``FillResult`` (consumed by EXEC-005). Hardening concerns owned here:
 
-  * **Idempotent submission** — ``order.clientExtensions.id = "sb-" + idempotency_key`` so a
-    retry after an ambiguous network failure reconciles from open trades/transactions
-    instead of ever placing a duplicate order.
+  * **Idempotent submission (F-303)** — ``order.clientExtensions.id = "sb-" + idempotency_key``
+    is only a *label*: OANDA does not dedupe market orders by it. The protection is that
+    ``submit`` **always reconciles the broker's recent transactions for that label before
+    ``create_order``** — not merely after a transient error — so a redelivered order whose
+    idempotency marker never became durable (a crash between the fill and ``mark()``) is
+    recognised as already submitted instead of being placed a second time. When the broker
+    cannot tell us, the order is *not* submitted; see ``_prior_submission``.
   * **Fill validation** — signed ``slippage_pips`` vs the expected price with a 2-pip
     tolerance; beyond tolerance is flagged (already-filled orders are accept-and-flagged,
     reported to System 3, not silently accepted).
@@ -27,7 +31,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
-from typing import Any, Callable, Protocol, runtime_checkable
+from typing import Any, Callable, Iterable, Protocol, runtime_checkable
 
 from system2.common.logging import get_logger, log_event
 from system2.common.secrets import Secrets, get_secrets
@@ -53,6 +57,13 @@ STD_DISPLAY_PRECISION = 5
 # A reference price older than this is not a price. Fail-closed: the caller refuses to build.
 DEFAULT_PRICE_MAX_AGE_SEC = 60.0
 
+# F-303: how far back the pre-submit reconcile looks for this order's client id. Bounded on
+# purpose — a duplicate can only arrive from a redelivery seconds-to-minutes old, and an
+# unbounded history scan on the money path is not acceptable. Verified against the live
+# practice account (2026-08-01): 200 ids covered ~35 market orders there, far more than any
+# redelivery window.
+RECONCILE_TRANSACTION_WINDOW = 200
+
 
 # --------------------------------------------------------------------------- #
 # Error taxonomy
@@ -63,6 +74,17 @@ class BrokerError(Exception):
 
 class TransientBrokerError(BrokerError):
     """Network / 5xx / rate-limit — safe to retry AFTER a reconcile check."""
+
+
+class ReconcileUnavailableError(TransientBrokerError):
+    """The broker could not tell us whether this order was already submitted (F-303).
+
+    Deliberately transient: the consumer's catch-all nacks it, the queue redelivers with
+    backoff, and the order is submitted as soon as the broker is readable again — so a
+    reconcile outage *defers* trading (visibly, and into the DLQ after
+    ``QUEUE_MAX_DELIVERY_ATTEMPTS``) rather than either halting it silently or doubling a
+    live position. Never raised for "checked, nothing found" — only for "could not check".
+    """
 
 
 class MarketClosedError(BrokerError):
@@ -234,6 +256,81 @@ class OandaPricingTransport(Protocol):
 
     def get_pricing(self, instruments: list[str]) -> list[dict[str, Any]]: ...
     def get_account_instruments(self, instruments: list[str] | None = None) -> list[dict[str, Any]]: ...
+
+
+@runtime_checkable
+class OandaReconcileTransport(Protocol):
+    """The read-only transaction-history half of the seam (F-303).
+
+    Separate from ``OandaTransport`` for the same reason ``OandaPricingTransport`` is: the
+    adapter feature-detects it so existing transports and test doubles stay conformant. The
+    *deployed* transport must implement it — ``OandaRestTransport`` does, and a test asserts
+    so — because without it the pre-submit reconcile degrades to open trades only.
+    """
+
+    def get_recent_transactions(self, count: int = ...) -> list[dict[str, Any]]: ...
+
+
+# --------------------------------------------------------------------------- #
+# Prior-submission verdict (F-303) — pure, unit-tested
+# --------------------------------------------------------------------------- #
+# What the broker's recent transactions say about one client order id.
+PRIOR_FILLED = "filled"      # an ORDER_FILL carries it: a position exists. NEVER resubmit.
+PRIOR_UNFILLED = "unfilled"  # the order was cancelled/rejected: nothing exists. Safe to submit.
+PRIOR_PENDING = "pending"    # the order is there with no outcome yet: ambiguous. Do not submit.
+PRIOR_ABSENT = "absent"      # not in the window at all: never submitted. Safe to submit.
+
+
+def transaction_client_order_id(txn: dict[str, Any]) -> str | None:
+    """The client-assigned order id a v20 transaction refers to, or ``None``.
+
+    Two different fields carry it, verified against the live practice transaction stream
+    (read-only probe, 2026-08-01): the *order* transaction carries it as
+    ``clientExtensions.id`` (``MARKET_ORDER``, reason ``CLIENT_ORDER``) while the *outcome*
+    transaction carries it as ``clientOrderID`` (``ORDER_FILL``, ``ORDER_CANCEL``).
+    """
+    raw = txn.get("clientOrderID")
+    if raw:
+        return str(raw)
+    raw = (txn.get("clientExtensions") or {}).get("id")
+    return str(raw) if raw else None
+
+
+def prior_submission_verdict(
+    transactions: Iterable[dict[str, Any]], client_order_id_: str
+) -> tuple[str, dict[str, Any] | None]:
+    """What a bounded transaction window says about ``client_order_id_``.
+
+    Returns ``(verdict, fill_transaction | None)``. Reading *transactions* rather than open
+    trades is what makes this complete: an order that filled and has since closed (SL/TP, or
+    a later flatten) is long gone from ``get_open_trades`` but its ``ORDER_FILL`` is
+    permanent — and those are exactly the orders whose resubmission has already cost money.
+    A fill that merely reduced an existing position opens no trade at all and is likewise
+    only visible here.
+
+    Anything carrying the id that is neither a fill nor a terminal outcome counts as
+    ``PRIOR_PENDING`` — unknown outcome resolves toward "do not submit", never toward "submit".
+    """
+    fill: dict[str, Any] | None = None
+    saw_order = False
+    saw_terminal = False
+    for txn in transactions or ():
+        if transaction_client_order_id(txn) != client_order_id_:
+            continue
+        txn_type = str(txn.get("type") or "").upper()
+        if txn_type == "ORDER_FILL":
+            fill = txn
+        elif txn_type == "ORDER_CANCEL" or txn_type.endswith("_REJECT"):
+            saw_terminal = True
+        else:
+            saw_order = True
+    if fill is not None:
+        return PRIOR_FILLED, fill
+    if saw_terminal:
+        return PRIOR_UNFILLED, None
+    if saw_order:
+        return PRIOR_PENDING, None
+    return PRIOR_ABSENT, None
 
 
 # --------------------------------------------------------------------------- #
@@ -466,7 +563,26 @@ class OandaAdapter:
         """Submit ``order`` idempotently, validate the fill, confirm stop/TP. Returns FillResult."""
         expected = expected_price if expected_price is not None else order.entry_price
         cid = client_order_id(order.idempotency_key)
-        payload = self._build_payload(order)
+        payload = self._build_payload(order)  # cheap local validation before any network call
+
+        # F-303 — ALWAYS reconcile before the first ``create_order``, not only after a
+        # transient error. A fresh ``submit()`` after a redelivery has no memory of the
+        # previous attempt; the broker does. This is what closes the window between the fill
+        # returning and the pipeline's ``processed.mark()`` becoming durable: if the process
+        # dies in it, no marker exists, the queue redelivers, and only this check stands
+        # between the approved order and a second live position.
+        prior, verified = self._prior_submission(cid, order, expected, model_set_id)
+        if prior is not None:
+            log_event(log, logging.WARNING,
+                      "this order is already at the broker; NOT resubmitting (reconciled)",
+                      idempotency_key=order.idempotency_key, client_order_id=cid,
+                      broker_trade_id=prior.broker_trade_id)
+            return prior
+        if not verified:
+            raise ReconcileUnavailableError(
+                f"{order.idempotency_key}: cannot prove this order was not already submitted; "
+                "refusing to risk a duplicate live position"
+            )
 
         resp: dict[str, Any] | None = None
         for attempt in range(1, self.retry_max + 1):
@@ -479,11 +595,18 @@ class OandaAdapter:
                 return self._reject(order, expected, model_set_id, "MARKET_CLOSED", "CANCELLED")
             except TransientBrokerError as exc:
                 # never blindly resubmit — reconcile first (the order may already be filled)
-                reconciled = self._reconcile(cid, order, expected, model_set_id)
+                reconciled, verified = self._prior_submission(cid, order, expected, model_set_id)
                 if reconciled is not None:
                     log_event(log, logging.INFO, "reconciled existing fill after transient error",
                               idempotency_key=order.idempotency_key)
                     return reconciled
+                if not verified:
+                    # An ambiguous send followed by an unreadable broker is the one state in
+                    # which a retry can genuinely double the position. Defer instead.
+                    raise ReconcileUnavailableError(
+                        f"{order.idempotency_key}: broker unreadable after an ambiguous submit; "
+                        "refusing to retry into a possible duplicate"
+                    ) from exc
                 if attempt >= self.retry_max:
                     log_event(log, logging.ERROR, "broker submit exhausted retries",
                               idempotency_key=order.idempotency_key, error=str(exc))
@@ -493,14 +616,73 @@ class OandaAdapter:
         assert resp is not None
         return self._build_fill_result(order, resp, expected, model_set_id)
 
+    # ----- reconcile (F-303) -------------------------------------------------
+    def _prior_submission(
+        self, cid: str, order: ConstructedOrder, expected: float, model_set_id: str | None
+    ) -> tuple[FillResult | None, bool]:
+        """Has this exact client order id already reached the broker? ``(fill, verified)``.
+
+        ``verified is False`` means *the broker could not tell us*, and the caller must then
+        refuse to submit. The judgement, stated once here: **"cannot verify" is resolved
+        toward "already submitted"**, because the two errors are not symmetric — refusing
+        defers an order that the queue will redeliver (and, failing that, dead-letters
+        visibly), whereas submitting blind can put a second live position on the book, which
+        nothing downstream can undo. Note also that a broker we cannot *read* is usually a
+        broker we should not be *writing* to.
+
+        The one place that judgement is inverted is a transport with no transaction-reading
+        capability at all. That is a deterministic property of the deployment, not a fact
+        about this order: failing closed on it would halt trading 100% of the time on a
+        misconfigured transport (the audit's own harness double is such a transport) instead
+        of protecting a rare window. So a missing capability degrades to the OPEN-trades
+        check — today's behaviour, never worse — loudly, while a *failed call* fails closed.
+        """
+        fetch = getattr(self.transport, "get_recent_transactions", None)
+        if fetch is None:
+            log_event(log, logging.WARNING,
+                      "transport cannot read recent transactions; pre-submit reconcile covers "
+                      "OPEN trades only (a filled-and-closed order would not be seen)",
+                      idempotency_key=order.idempotency_key)
+            return self._reconcile(cid, order, expected, model_set_id)
+
+        try:
+            transactions = fetch(RECONCILE_TRANSACTION_WINDOW) or []
+        except Exception as exc:  # noqa: BLE001 — any failure here is "cannot verify"
+            log_event(log, logging.ERROR,
+                      "pre-submit reconcile failed; cannot prove this order is unsubmitted",
+                      idempotency_key=order.idempotency_key, error=str(exc))
+            return None, False
+
+        verdict, fill_txn = prior_submission_verdict(transactions, cid)
+        if verdict == PRIOR_FILLED:
+            # Reuse the normal fill path so a reconciled fill is validated (slippage) and has
+            # its stop/TP confirmed exactly like a freshly returned one.
+            return self._build_fill_result(
+                order, {"orderFillTransaction": fill_txn}, expected, model_set_id
+            ), True
+        if verdict == PRIOR_PENDING:
+            log_event(log, logging.ERROR,
+                      "an order with this client id is at the broker with no fill or cancel; "
+                      "refusing to resubmit until its outcome is known",
+                      idempotency_key=order.idempotency_key, client_order_id=cid)
+            return None, False
+        return None, True  # PRIOR_ABSENT (never submitted) or PRIOR_UNFILLED (nothing exists)
+
     def _reconcile(
         self, cid: str, order: ConstructedOrder, expected: float, model_set_id: str | None
-    ) -> FillResult | None:
-        """Look for an already-open trade carrying our client id; return its FillResult if found."""
+    ) -> tuple[FillResult | None, bool]:
+        """Open-trades fallback: ``(fill, verified)`` for transports without transaction reads.
+
+        Proves *presence* reliably; its "absent" is best-effort only — a trade that has
+        already closed, or a fill that merely reduced a position, never appears here. A failed
+        lookup is reported as unverified so the caller still fails closed.
+        """
         try:
             trades = self.transport.get_open_trades()
-        except BrokerError:
-            return None
+        except BrokerError as exc:
+            log_event(log, logging.ERROR, "open-trades reconcile failed; order not verifiable",
+                      idempotency_key=order.idempotency_key, error=str(exc))
+            return None, False
         for t in trades:
             ext = (t.get("clientExtensions") or {}).get("id")
             if ext == cid:
@@ -514,8 +696,8 @@ class OandaAdapter:
                     fill_price=fill_price,
                     fill_time=t.get("openTime"),
                     trade=t,
-                )
-        return None
+                ), True
+        return None, True
 
     def _build_fill_result(
         self, order: ConstructedOrder, resp: dict[str, Any], expected: float, model_set_id: str | None
@@ -605,6 +787,12 @@ class OandaAdapter:
                 trade = None
         if not trade:
             return order.stop_loss, order.take_profit, False  # cannot verify; not proven unsafe
+        if str(trade.get("state") or "OPEN").upper() != "OPEN":
+            # No live position, so no stop to confirm and nothing to repair. Reachable via the
+            # F-303 reconcile, which can legitimately recover a fill that has already closed;
+            # attaching a stop to a closed trade would be a pointless write and flagging it
+            # NO_STOP_UNSAFE would be a false risk alert.
+            return None, None, False
 
         sl = trade.get("stopLossOrder")
         tp = trade.get("takeProfitOrder")
