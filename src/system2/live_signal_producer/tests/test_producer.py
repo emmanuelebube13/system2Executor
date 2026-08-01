@@ -300,3 +300,132 @@ def test_sweep_writes_persistent_ledger_rows(tmp_path: Path):
     # /signal surface carries the ledger block
     snap = producer.telemetry_snapshot()
     assert snap["ledger"]["total_published"] == produced
+
+
+# ----- FIX_PLAN 2.1(d): runtime approval-rate monitor wiring -----------------------
+def test_sweep_feeds_the_approval_monitor_and_publishes_it_on_signal(tmp_path: Path):
+    """Every gatekeeper verdict must reach the monitor, and the monitor must be visible
+    on the same /signal payload ``bridge/ops_watchdog.py`` already polls."""
+    root = _make_root(tmp_path)          # thresholds 0.0 => everything approves
+    producer = _make_producer(tmp_path, root)
+    produced = producer.sweep_once()
+    assert produced >= 1
+
+    snap = producer.telemetry_snapshot()["approval_monitor"]
+    assert snap["evaluations"] == produced
+    assert snap["approved"] == produced          # threshold 0.0: all approved
+    assert snap["approval_rate"] == 1.0
+    assert snap["state"] == "warming_up"         # far below the 50-sample floor
+    assert snap["alarm"] is False                # ...so it does NOT cry wolf
+
+
+def test_approval_monitor_alarms_once_it_has_enough_evidence(tmp_path: Path):
+    """Drive the producer's own monitor past the floor with an all-approve stream."""
+    root = _make_root(tmp_path)
+    producer = _make_producer(tmp_path, root)
+    for _ in range(120):
+        producer.approval_monitor.observe(True)
+
+    snap = producer.telemetry_snapshot()["approval_monitor"]
+    assert snap["state"] == "out_of_band"
+    assert snap["alarm"] is True
+    assert snap["band"] == [0.05, 0.60]          # the default; this manifest omits it
+    assert producer._poll_approval_alarm()["event"] == "opened"
+    assert producer._poll_approval_alarm() is None   # throttled, not once per sweep
+
+
+def test_band_is_adopted_from_the_champion_manifest(tmp_path: Path):
+    """The band is System 1's, shipped in the manifest — never a second S2 opinion."""
+    root = tmp_path / "banded-cache"
+    manifest = make_manifest(turnover_band=[0.10, 0.42])
+    write_champion_set(root / "active", manifest=manifest)
+    (root / "state.json").write_text(json.dumps({"active_model_set_id": "set-A"}),
+                                     encoding="utf-8")
+    producer = _make_producer(tmp_path, root)
+    producer.sweep_once()
+    assert producer.gatekeeper.turnover_band == [0.10, 0.42]
+    assert producer.approval_monitor.snapshot()["band"] == [0.10, 0.42]
+    assert producer.approval_monitor.snapshot()["band_source"] == "manifest"
+
+
+def test_monitor_is_seeded_from_the_ledger_across_a_restart(tmp_path: Path):
+    root = _make_root(tmp_path)
+    first = _make_producer(tmp_path, root)
+    produced = first.sweep_once()
+    assert produced >= 1
+
+    restarted = _make_producer(tmp_path, root)      # same SIGNAL_LEDGER_PATH
+    snap = restarted.approval_monitor.snapshot()
+    assert snap["seeded_from_ledger"] is True
+    assert snap["evaluations"] >= produced
+
+
+def test_alarm_alone_does_not_stop_trading(tmp_path: Path):
+    """Fail-LOUD is the default: a breached band alarms, it does not withhold signals."""
+    root = _make_root(tmp_path)
+    queue = FakeQueue()
+    producer = _make_producer(tmp_path, root, queue=queue)
+    for _ in range(200):
+        producer.approval_monitor.observe(True)
+    assert producer.approval_monitor.alarming is True
+    assert producer.approval_monitor.enforcing is False
+
+    assert producer.sweep_once() == 2                       # unchanged behaviour
+    assert len([b for _, b in queue.published if "event_type" not in b]) == 2
+
+
+def test_enforcement_when_armed_withholds_approved_signals(tmp_path: Path):
+    """Fail-CLOSED is a config flip, not a code change: SIGNAL_APPROVAL_BAND_ENFORCE."""
+    root = _make_root(tmp_path)
+    queue = FakeQueue()
+    producer = _make_producer(tmp_path, root, queue=queue)
+    producer.approval_monitor.enforcing = True
+    for _ in range(200):
+        producer.approval_monitor.observe(True)
+
+    assert producer.sweep_once() == 0
+    assert [b for _, b in queue.published if "event_type" not in b] == []
+    # the withheld evaluation is still recorded: approved by the gate, never published
+    agg = producer.ledger.daily_aggregates()
+    assert agg["total_approved"] == 2 and agg["total_published"] == 0
+
+
+def test_enforcement_flag_is_read_from_secrets(tmp_path: Path):
+    root = _make_root(tmp_path)
+    secrets = FakeSecrets({
+        "SIGNAL_INSTRUMENTS": "EUR_USD", "SIGNAL_GRANULARITIES": "H1",
+        "SIGNAL_LEDGER_PATH": str(tmp_path / "ledger2.db"),
+        "SIGNAL_APPROVAL_BAND_ENFORCE": "true",
+        "SIGNAL_APPROVAL_WINDOW": "50", "SIGNAL_APPROVAL_MIN_SAMPLES": "10",
+    })
+    producer = LiveSignalProducer(
+        artifact_root=root, queue=FakeQueue(), regime_detector=FakeDetector(),
+        secrets=secrets, candle_source=FakeCandleSource(),
+        dedup=SignalDedupStore(tmp_path / "dedup2.db"))
+    snap = producer.approval_monitor.snapshot()
+    assert snap["enforcing"] is True
+    assert snap["window"] == 50 and snap["min_samples"] == 10
+
+
+def test_shadow_mode_still_reports_the_approval_monitor(tmp_path: Path):
+    """Shadow still SCORES, so the gate is still measurable — and FIX_PLAN 2.1 ships
+    the recalibration in shadow. A drifted gate must not go invisible there."""
+    root = _make_root(tmp_path)
+    producer = _make_producer(tmp_path, root, enabled=False)
+    producer.sweep_once()
+    snap = producer.telemetry_snapshot()
+    assert snap["running"] is False
+    assert snap["approval_monitor"]["evaluations"] >= 1
+
+
+def test_monitor_failure_never_breaks_the_health_surface(tmp_path: Path):
+    root = _make_root(tmp_path)
+    producer = _make_producer(tmp_path, root)
+
+    class Exploding:
+        def snapshot(self):
+            raise RuntimeError("boom")
+
+    producer.approval_monitor = Exploding()
+    snap = producer.approval_monitor_snapshot()
+    assert snap["alarm"] is False and "monitor unavailable" in snap["reason"]

@@ -41,6 +41,11 @@ from system2.artifact_sync.features import compute_regime_features
 from system2.common.logging import get_logger, log_event, set_correlation_id
 from system2.common.queue_backend import make_envelope
 from system2.common.secrets import Secrets, get_secrets
+from system2.live_signal_producer.approval_monitor import (
+    DEFAULT_MIN_SAMPLES,
+    DEFAULT_WINDOW,
+    ApprovalRateMonitor,
+)
 from system2.live_signal_producer.dedup import SignalDedupStore, make_dedup_key
 from system2.live_signal_producer.gatekeeper import GatekeeperScorer, price_position_20
 from system2.live_signal_producer.signal_builder import StrategyBook, build_signal
@@ -110,6 +115,29 @@ class LiveSignalProducer:
             self.secrets.get("SIGNAL_LEDGER_PATH", "state/signals/signal_ledger.db")
         )
 
+        # FIX_PLAN 2.1(d) / F-602 — the RUNTIME approval-rate monitor. The [5%, 60%]
+        # turnover band shipped in the champion manifest was enforced only at TRAINING
+        # time; nothing ever checked what the deployed model approves. It drifted to
+        # 1893/1894 = 0.9995 and ran that way for weeks, unalarmed. The band is read
+        # from the manifest on model load (see _maybe_reload) so System 1 stays the
+        # authority on it; the window is seeded from the persistent ledger so a restart
+        # does not erase the measurement.
+        self.approval_monitor = ApprovalRateMonitor(
+            window=self.secrets.get_int("SIGNAL_APPROVAL_WINDOW", DEFAULT_WINDOW),
+            min_samples=self.secrets.get_int("SIGNAL_APPROVAL_MIN_SAMPLES", DEFAULT_MIN_SAMPLES),
+            # Fail-LOUD by default; fail-CLOSED only when an operator explicitly arms it.
+            # Rationale in approval_monitor.py's module docstring.
+            enforcing=self.secrets.get_bool("SIGNAL_APPROVAL_BAND_ENFORCE", False),
+        )
+        seeded = self.approval_monitor.seed(
+            self.ledger.recent_verdicts(self.approval_monitor.snapshot()["window"])
+        )
+        if seeded:
+            log_event(log, logging.INFO, "approval-rate monitor seeded from ledger",
+                      verdicts=seeded, **{
+                          k: self.approval_monitor.snapshot()[k]
+                          for k in ("state", "approval_rate", "band")})
+
         self._model_set_id: str | None = None
         self._last_signal_at: str | None = None
         self._last_outbound_at: datetime | None = None
@@ -163,9 +191,14 @@ class LiveSignalProducer:
         active = self._active_dir()
         gk_ok = self.gatekeeper.load(active)
         book_ok = self.book.load(active)
+        if gk_ok:
+            # The band is manifest content (System 1's). Re-read it on every rollover so
+            # a retrain that ships a different band is honoured without a code change.
+            self.approval_monitor.set_band(self.gatekeeper.turnover_band)
         log_event(log, logging.INFO, "model set (re)load",
                   model_set_id=current, previous=self._model_set_id,
-                  gatekeeper=gk_ok, strategy_book=book_ok)
+                  gatekeeper=gk_ok, strategy_book=book_ok,
+                  turnover_band=self.gatekeeper.turnover_band)
         self._model_set_id = current
 
     # ----- telemetry (read-only /signal surface) --------------------------------------
@@ -203,11 +236,36 @@ class LiveSignalProducer:
             self._signals_by_regime[regime] = self._signals_by_regime.get(regime, 0) + 1
             self._last_signal_at = produced_at
 
+    def approval_monitor_snapshot(self) -> dict[str, Any]:
+        """The runtime approval-rate block, for /signal and the HealthReporter.
+
+        HANDOFF (bridge/ is outside this change's allow-list): ``bridge/ops_watchdog.py``
+        already GETs this endpoint (``S2_SIGNAL``) and evaluates it in the pure
+        ``eval_s2(health, signal)``. Making the band breach page Telegram is three lines
+        there and nothing more::
+
+            mon = (signal.get("approval_monitor") or {})
+            if mon.get("alarm"):
+                problems["s2:approval_rate"] = mon.get("reason")
+
+        Until that lands, the breach is visible on /signal and /status and in the
+        producer's ERROR log, but it does not page.
+        """
+        try:
+            return self.approval_monitor.snapshot()
+        except Exception as exc:  # never break the health surface
+            return {"state": "unknown", "alarm": False,
+                    "reason": f"monitor unavailable: {type(exc).__name__}: {exc}"}
+
     def telemetry_snapshot(self) -> dict[str, Any]:
         """The GET /signal payload. Never raises; safe to call from the health thread."""
         now = datetime.now(timezone.utc)
         if not self.enabled:
-            return {"running": False, "reason": "disabled (LIVE_SIGNAL_ENABLED=false)"}
+            return {"running": False, "reason": "disabled (LIVE_SIGNAL_ENABLED=false)",
+                    # Shadow mode still SCORES, so the gate can still be measured — and
+                    # a drifted gate must not become invisible just because publishing
+                    # is off. FIX_PLAN 2.1 ships the recalibration in shadow first.
+                    "approval_monitor": self.approval_monitor_snapshot()}
         with self._stats_lock:
             avg = (self._score_sum / self._score_count) if self._score_count else None
             heartbeat_age = (
@@ -226,6 +284,11 @@ class LiveSignalProducer:
                 "signals_by_pair": dict(self._signals_by_pair),
                 "signals_by_regime": dict(self._signals_by_regime),
                 "avg_gatekeeper_score": round(avg, 6) if avg is not None else None,
+                # FIX_PLAN 2.1(d): the runtime approval-rate measurement + band verdict.
+                # `avg_gatekeeper_score` alone was already visible (0.759 live) and told
+                # nobody anything — a mean score has no declared band to be judged
+                # against. This block does.
+                "approval_monitor": self.approval_monitor_snapshot(),
                 "last_regime": dict(self._last_regime_by_pair),
                 "uptime_sec": round((now - self._started_at).total_seconds(), 1),
                 # OBS-001: persistent measurements (survive restarts); None => no ledger
@@ -251,8 +314,45 @@ class LiveSignalProducer:
                     log_event(log, logging.WARNING, "signal cell failed",
                               instrument=instrument, granularity=granularity,
                               error=type(exc).__name__, detail=str(exc))
+        self._poll_approval_alarm()
         self._heartbeat_if_quiet()
         return produced
+
+    def _poll_approval_alarm(self) -> dict[str, Any] | None:
+        """Emit the approval-rate alarm at episode edges (FIX_PLAN 2.1(d)).
+
+        Two channels, deliberately:
+          * a structured ERROR log line here, so the alarm exists even if nothing is
+            polling the HTTP surface;
+          * the ``approval_monitor`` block in ``telemetry_snapshot()`` (GET /signal),
+            which ``bridge/ops_watchdog.py`` already fetches every run — that is the
+            one path proven to page a human (Telegram). See the handoff note in
+            ``telemetry_snapshot``.
+        Throttled to open/reminder/resolved so a standing breach cannot spam the log
+        into being ignored, which is how the original defect stayed invisible.
+        """
+        try:
+            event = self.approval_monitor.poll_alert(datetime.now(timezone.utc).timestamp())
+        except Exception as exc:  # a monitor must never break the thing it monitors
+            log_event(log, logging.WARNING, "approval-rate monitor poll failed",
+                      error=type(exc).__name__, detail=str(exc))
+            return None
+        if event is None:
+            return None
+        if event["event"] == "resolved":
+            log_event(log, logging.WARNING, "gatekeeper approval rate back inside band",
+                      approval_rate=event["approval_rate"], band=event["band"],
+                      evaluations=event["evaluations"])
+            return event
+        log_event(log, logging.ERROR,
+                  "GATEKEEPER APPROVAL RATE OUT OF BAND — the ML gate is not gating",
+                  event=event["event"], reason=event["reason"],
+                  approval_rate=event["approval_rate"], ci99=event["ci99"],
+                  band=event["band"], band_source=event["band_source"],
+                  evaluations=event["evaluations"], approved=event["approved"],
+                  window=event["window"], enforcing=event["enforcing"],
+                  model_set_id=self._model_set_id)
+        return event
 
     def _process_cell(self, instrument: str, granularity: str) -> int:
         """Full pipeline for one cell: candles -> features -> regime -> score -> signals."""
@@ -314,8 +414,12 @@ class LiveSignalProducer:
                 continue
             gate = self.gatekeeper.score(feature_row, regime)
             if gate is None:
+                # F-103: the gatekeeper REFUSED (unknown category / non-finite input) or
+                # inference failed. Refusal is the default-safe answer — never a signal.
                 continue
             self._record_score(gate.score)
+            # FIX_PLAN 2.1(d): every verdict feeds the runtime approval-rate monitor.
+            self.approval_monitor.observe(gate.approved)
 
             key = make_dedup_key(instrument, granularity, bar_iso, strategy.strategy_id)
             signal = build_signal(
@@ -336,6 +440,22 @@ class LiveSignalProducer:
                     regime=regime, strategy_id=strategy.strategy_id, direction=direction,
                     score=gate.score, threshold=gate.threshold,
                     approved=False, published=False, signal_id=signal["signal_id"])
+                continue
+            if self.approval_monitor.should_block():
+                # Fail-CLOSED path — OFF unless SIGNAL_APPROVAL_BAND_ENFORCE=true was
+                # explicitly armed. Default is alarm-only; see approval_monitor.py.
+                log_event(log, logging.ERROR,
+                          "approval-rate band breached and enforcement armed; "
+                          "withholding approved signal",
+                          signal_id=signal["signal_id"], pair=instrument,
+                          strategy_id=strategy.strategy_id,
+                          **{k: self.approval_monitor.snapshot()[k]
+                             for k in ("approval_rate", "band", "evaluations")})
+                self.ledger.record(
+                    bar_time=bar_iso, pair=instrument, granularity=granularity,
+                    regime=regime, strategy_id=strategy.strategy_id, direction=direction,
+                    score=gate.score, threshold=gate.threshold,
+                    approved=True, published=False, signal_id=signal["signal_id"])
                 continue
             published = self._publish_signal(signal)
             self.ledger.record(

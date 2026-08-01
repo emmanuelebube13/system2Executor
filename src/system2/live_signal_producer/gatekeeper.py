@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,67 @@ DEFAULT_APPROVAL_THRESHOLD = 0.20
 
 # Manifest fields that must be present before we are allowed to score (layer3-contract).
 _MANDATORY_MANIFEST_FIELDS = ("features",)
+
+
+def _known_categories(preprocessor: Any) -> dict[str, frozenset[str]]:
+    """Read the categorical vocabulary the model was actually fitted on (F-103).
+
+    The champion preprocessor is a ``ColumnTransformer`` whose ``cat`` step is a
+    ``OneHotEncoder(handle_unknown='ignore')`` over ``regime_causal / strategy_id /
+    entry_signal_type``. ``handle_unknown='ignore'`` is the whole defect: a value the
+    model has never seen silently encodes as an all-zero block and still gets a number
+    back. Measured on the live champion, ``strategy_id="999"`` scores **0.4802**, which
+    clears the deployed High-Vol threshold of 0.45 — an unknown strategy is APPROVED.
+
+    So we ask the fitted encoder what it actually knows and refuse anything else.
+    Derived from ``categories_`` rather than a hardcoded list precisely so a retrain
+    that legitimately adds strategy 11 starts accepting strategy 11 the moment its
+    artifacts land — the guard tracks the shipped model, it does not second-guess it.
+
+    Returns ``{}`` when no such vocabulary is discoverable, which degrades to the old
+    (unguarded) behaviour rather than refusing everything.
+    """
+    known: dict[str, frozenset[str]] = {}
+    try:
+        transformers = getattr(preprocessor, "transformers_", None) or []
+        for _name, trans, cols in transformers:
+            cats = getattr(trans, "categories_", None)
+            if cats is None or isinstance(cols, str):
+                continue
+            for col, values in zip(list(cols), list(cats)):
+                known[str(col)] = frozenset(str(v) for v in list(values))
+    except Exception as exc:  # never let introspection break loading
+        log_event(log, logging.WARNING, "could not read model categories; "
+                  "unknown-category refusal is DISABLED for this model set",
+                  error=type(exc).__name__, detail=str(exc))
+        return {}
+    return known
+
+
+def _nonfinite_fields(row: dict[str, Any]) -> list[str]:
+    """Names of numeric fields in ``row`` that are NaN or +/-inf (F-103).
+
+    ``build_feature_row`` only ever tested ``value is None``, and ``float('nan') is not
+    None`` — so a row carrying NaN regime posteriors was scored (measured 0.4391)
+    because XGBoost consumes NaN natively as a "missing" branch direction. That is a
+    model answering a question it was never asked. NaN also propagates through the
+    derived columns invisibly: ``trending_strength = p_up + p_down`` inherits it, and
+    ``volatility_regime = 1.0 if p_hv > 0.3 else 0.0`` maps it to a confident 0.0
+    because ``nan > 0.3`` is False.
+
+    Note this is NOT covered by the message-contract validators (System 3's validator
+    and System 2's ``validate_envelope``): those police the ScoredSignal on the wire,
+    which is produced *downstream* of this scoring call. The model's inputs come from
+    the live regime detector and OANDA candles and cross no envelope at all.
+    """
+    bad = []
+    for key, value in row.items():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float, np.floating, np.integer)):
+            if not math.isfinite(float(value)):
+                bad.append(key)
+    return sorted(bad)
 
 
 @dataclass(frozen=True)
@@ -84,6 +146,7 @@ class GatekeeperScorer:
         self._preprocessor: Any = None
         self._manifest: dict[str, Any] | None = None
         self._loaded_from: Path | None = None
+        self._known_categories: dict[str, frozenset[str]] = {}
 
     @property
     def loaded(self) -> bool:
@@ -96,6 +159,29 @@ class GatekeeperScorer:
     @property
     def features(self) -> list[str]:
         return list((self._manifest or {}).get("features", []))
+
+    @property
+    def known_categories(self) -> dict[str, frozenset[str]]:
+        """The categorical vocabulary the loaded model was fitted on (F-103)."""
+        return dict(self._known_categories)
+
+    @property
+    def turnover_band(self) -> list[float] | None:
+        """The ``[min, max]`` approval-rate band System 1 trained under, if declared.
+
+        The live champion manifest ships ``"turnover_band": [0.05, 0.6]`` next to
+        ``"oos_approval_rate": 0.3379``. It was enforced at training time and never at
+        runtime (F-602 / FIX_PLAN 2.1(d)); exposing it here lets the runtime monitor
+        judge the live rate against the model's OWN declared band instead of a second,
+        divergent number kept in System 2.
+        """
+        band = (self._manifest or {}).get("turnover_band")
+        if isinstance(band, (list, tuple)) and len(band) >= 2:
+            try:
+                return [float(band[0]), float(band[1])]
+            except (TypeError, ValueError):
+                return None
+        return None
 
     # ----- loading / hot-reload ---------------------------------------------------
     def load(self, set_dir: Path) -> bool:
@@ -122,9 +208,12 @@ class GatekeeperScorer:
             return False
         self._model, self._preprocessor, self._manifest = model, preprocessor, manifest
         self._loaded_from = set_dir
+        self._known_categories = _known_categories(preprocessor)
         log_event(log, logging.INFO, "gatekeeper loaded",
                   path=str(set_dir), features=len(manifest["features"]),
-                  model_type=manifest.get("model_type"))
+                  model_type=manifest.get("model_type"),
+                  guarded_categories=sorted(self._known_categories),
+                  turnover_band=self.turnover_band)
         return True
 
     # ----- feature assembly ---------------------------------------------------------
@@ -204,12 +293,62 @@ class GatekeeperScorer:
             if value is None:
                 return None  # warm-up NaN or missing strategy/direction context
             row[feature] = value
+        if self.refusal_reason(row) is not None:
+            return None  # logged by refusal_reason; caller treats None as "do not score"
         return row
+
+    # ----- input validation (F-103) -------------------------------------------------
+    def refusal_reason(self, feature_row: dict[str, Any]) -> str | None:
+        """Why this row must NOT be scored, or None if it is safe to score.
+
+        The default-safe contract for this system is "missing / stale / error => reject".
+        Two boundary cases used to violate it *at the model interface* (F-103), and both
+        are silent by nature — they produce a plausible number rather than an error:
+
+          1. a value outside the model's fitted categorical vocabulary (unknown
+             ``strategy_id`` etc.), which ``handle_unknown='ignore'`` turns into an
+             all-zero block and a generic ~0.48 score that clears the 0.45 High-Vol
+             threshold;
+          2. a non-finite numeric (NaN/inf), which XGBoost happily routes down its
+             missing-value branch.
+
+        A model asked to score something it has never seen must say "I cannot", not
+        return a number that happens to clear a threshold. Both now refuse, loudly.
+        """
+        if not isinstance(feature_row, dict):
+            return "feature row is not a mapping"
+        bad_numeric = _nonfinite_fields(feature_row)
+        if bad_numeric:
+            log_event(log, logging.WARNING,
+                      "non-finite feature value; REFUSING to score (F-103)",
+                      fields=bad_numeric,
+                      values={k: repr(feature_row[k]) for k in bad_numeric})
+            return f"non-finite feature(s): {bad_numeric}"
+        for column, allowed in self._known_categories.items():
+            if column not in feature_row:
+                continue
+            value = feature_row[column]
+            if value is None or str(value) not in allowed:
+                log_event(log, logging.WARNING,
+                          "value outside the model's fitted categories; "
+                          "REFUSING to score (F-103)",
+                          column=column, value=repr(value),
+                          known=sorted(allowed)[:24])
+                return f"unknown category for {column}: {value!r}"
+        return None
 
     # ----- scoring -----------------------------------------------------------------
     def score(self, feature_row: dict[str, Any], regime: str) -> GateScore | None:
-        """Score one feature row; None when no gatekeeper is loaded or inference fails."""
+        """Score one feature row; None when no gatekeeper is loaded, the row is refused
+        (F-103: unknown category or non-finite value), or inference fails.
+
+        The check is repeated here rather than trusted from ``build_feature_row``
+        because ``score`` is a public entry point: this is the last line before the
+        model, so it is where the refusal has to be unconditional.
+        """
         if not self.loaded:
+            return None
+        if self.refusal_reason(feature_row) is not None:
             return None
         try:
             X_df = pd.DataFrame([feature_row], columns=self.features)

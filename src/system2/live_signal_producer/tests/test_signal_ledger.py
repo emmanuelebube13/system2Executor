@@ -70,3 +70,25 @@ def test_aggregates_cache_serves_within_window(tmp_path):
     led.record(**_row(signal_id="sig-2"))
     # within the 30s cache window the stale-but-cheap copy is returned
     assert led.daily_aggregates() is first
+
+
+# ----- FIX_PLAN 2.1(d): seeding the runtime approval-rate monitor ------------------
+def test_recent_verdicts_returns_oldest_first_and_is_bounded(tmp_path):
+    led = SignalLedger(tmp_path / "ledger.db")
+    pattern = [True, False, True, True, False]
+    for i, ok in enumerate(pattern):
+        led.record(**{**_row(signal_id=f"sig-{i}"), "approved": ok})
+    assert led.recent_verdicts(10) == pattern          # oldest -> newest
+    assert led.recent_verdicts(2) == pattern[-2:]      # the LAST n, not the first
+    assert led.recent_verdicts(0) == []
+
+
+def test_recent_verdicts_on_an_unusable_ledger_is_empty_not_fatal(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "ledger.db"
+    led = SignalLedger(path)
+    led.record(**_row())
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TABLE signal_evaluations")
+    assert led.recent_verdicts(50) == []               # logged, not raised

@@ -108,6 +108,29 @@ class SignalLedger:
                       error=str(exc))
 
     # ---- read side (called from the health thread) ---------------------------
+    def recent_verdicts(self, limit: int = 200) -> list[bool]:
+        """The last ``limit`` gatekeeper verdicts, oldest-first.
+
+        Seeds the runtime approval-rate monitor (FIX_PLAN 2.1(d)) at startup so the
+        measurement survives a restart. Without it, a process that restarts often
+        enough would never accumulate the monitor's minimum sample count and a drifted
+        model could stay permanently unjudged — the same "nobody was looking" shape
+        that let the 0.9995 live approval rate run for weeks. Never raises; an
+        unusable ledger just means the monitor starts cold.
+        """
+        if not self._ok:
+            return []
+        try:
+            with self._lock, self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT approved FROM signal_evaluations ORDER BY id DESC LIMIT ?",
+                    (max(0, int(limit)),),
+                ).fetchall()
+        except Exception as exc:
+            log_event(log, logging.WARNING, "signal ledger verdict read failed", error=str(exc))
+            return []
+        return [bool(r[0]) for r in reversed(rows)]
+
     def daily_aggregates(self, days: int = 14) -> dict[str, Any] | None:
         """Per-UTC-day evaluation/approval/publish counts for the last N days.
 

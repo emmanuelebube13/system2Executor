@@ -49,6 +49,13 @@ class HealthReporter:
     broker_env_fn: Callable[[], str] | None = None
     account_summary_fn: Callable[[], dict[str, Any]] | None = None
     regime_grid_fn: Callable[[], list[dict[str, Any]]] | None = None
+    # FIX_PLAN 2.1(d) / F-602 — the live gatekeeper approval rate against the band the
+    # champion manifest declares. Exposed here for the same reason as
+    # `queue.staleness_limit_sec` (F-304): the EFFECTIVE safety posture this process is
+    # running with has to be auditable from the outside, without shell access to the
+    # box. The live gate drifted to a 0.9995 approval rate for weeks because the only
+    # published number was a mean score, which has no band to be judged against.
+    gatekeeper_approval_fn: Callable[[], dict[str, Any] | None] | None = None
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
     _started_at: datetime | None = None
 
@@ -125,7 +132,32 @@ class HealthReporter:
             "broker_env": self._safe(self.broker_env_fn, "unknown"),
             "account_summary": self._safe(self.account_summary_fn, {}),
             "regime": self._regime_summary(),
+            "gatekeeper": self._gatekeeper_summary(),
             "as_of": _utc_iso(self.clock()),
+        }
+
+    # ----- gatekeeper approval-rate band (FIX_PLAN 2.1(d)) -------------------
+    def _gatekeeper_summary(self) -> dict[str, Any]:
+        """Compact roll-up of the runtime approval-rate monitor for the status tile.
+
+        Degrades to ``state: "unavailable"`` when no provider is wired — an honest
+        "not measured" rather than a reassuring absence. The full detail (window,
+        counts, confidence interval) stays on GET /signal, which is also the payload
+        ``bridge/ops_watchdog.py`` already polls.
+        """
+        snap = self._safe(self.gatekeeper_approval_fn)
+        if not isinstance(snap, dict):
+            return {"state": "unavailable", "alarm": False,
+                    "reason": "no approval-rate provider wired"}
+        return {
+            "state": snap.get("state", "unknown"),
+            "alarm": bool(snap.get("alarm", False)),
+            "reason": snap.get("reason"),
+            "approval_rate": snap.get("approval_rate"),
+            "band": snap.get("band"),
+            "evaluations": snap.get("evaluations"),
+            "window": snap.get("window"),
+            "enforcing": snap.get("enforcing"),
         }
 
     # ----- regime (EXEC-002): live market regime per instrument x granularity -----
