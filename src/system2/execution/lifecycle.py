@@ -405,7 +405,16 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
         except Exception:
             return None
 
+    # The gatekeeper's runtime approval-rate band (F-602, FIX_PLAN 2.1(d)). Reads through the
+    # producer when one was built; `None` when it was not, which the reporter renders as an
+    # explicit "unavailable" rather than a false all-clear.
+    def _gatekeeper_approval() -> dict[str, Any] | None:
+        p = signal_producer
+        mon = getattr(p, "approval_monitor", None) if p is not None else None
+        return mon.snapshot() if mon is not None else None
+
     reporter = HealthReporter(
+        gatekeeper_approval_fn=_gatekeeper_approval,
         safety_state_fn=lambda: monitor.state.value,
         model_set_id_fn=_active_model_set_id,
         staleness_fn=lambda: monitor.staleness_seconds(monitor.clock(), consumer.lag.last_message_at),
