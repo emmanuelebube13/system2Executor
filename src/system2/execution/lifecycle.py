@@ -259,7 +259,7 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
     )
     from system2.execution.fill_producer import FillProducer, build_outbox
     from system2.execution.outbound_consumer import OutboundConsumer, SqliteProcessedStore
-    from system2.execution.pipeline import ExecMode, ExecutionPipeline
+    from system2.execution.pipeline import ExecMode, ExecutionPipeline, resolve_shadow
     from system2.execution.safety_mode import SafetyConfig, SafetyMonitor
     from system2.execution.validation import OrderValidator
     from system2.telemetry.health import HealthReporter
@@ -289,8 +289,13 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
             log_event(log, logging.ERROR, "trade recorder disabled (datastore setup failed)", error=str(exc))
 
     processed = SqliteProcessedStore(secrets.get("PROCESSED_STORE_PATH", "state/offsets/processed.db"))
+    # F-309 / OD-5: resolved in ONE place (execution.pipeline.resolve_shadow), and the
+    # production path refuses to default — an absent EXEC_SHADOW aborts startup instead of
+    # quietly choosing whether orders reach the broker. This used to read
+    # `secrets.get_bool("EXEC_SHADOW", True)` here while pipeline.py defaulted it False.
+    exec_shadow = resolve_shadow(secrets, require_explicit=True)
     pipeline = ExecutionPipeline(mode=ExecMode.EXECUTION_ONLY,
-                                 shadow=secrets.get_bool("EXEC_SHADOW", True),  # SHADOW until cutover
+                                 shadow=exec_shadow,
                                  processed_store=processed, secrets=secrets)
     monitor = SafetyMonitor(config=SafetyConfig.from_secrets(secrets))
 
@@ -405,6 +410,10 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
                                    for t in position_manager.trades.values() if not t.closed],
         outbox_depth_fn=lambda: outbox.depth("fill_outbox"),
         broker_env_fn=lambda: adapter.env.env,
+        # Read off the PIPELINE, not off `secrets` — the health surface must report what
+        # this process actually resolved and is running with, not what the config file
+        # says it should have resolved (F-309).
+        shadow_fn=lambda: consumer.pipeline.shadow,
         account_summary_fn=adapter.get_account_summary,
         regime_grid_fn=(regime_scheduler.grid if regime_scheduler is not None else None),
     )

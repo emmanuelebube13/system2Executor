@@ -56,6 +56,17 @@ class HealthReporter:
     # box. The live gate drifted to a 0.9995 approval rate for weeks because the only
     # published number was a mean score, which has no band to be judged against.
     gatekeeper_approval_fn: Callable[[], dict[str, Any] | None] | None = None
+    # F-309 / OD-5 — the EFFECTIVE `EXEC_SHADOW` this process resolved at startup: True =
+    # orders are constructed and validated but NOT submitted to the broker, False = they
+    # are sent for real. Exposed for exactly the reason `queue.staleness_limit_sec` is
+    # (F-304): the deployed safety posture must be auditable from outside the box. It was
+    # on no HTTP surface at all, while its two code defaults disagreed — so the deployed
+    # reality was unreadable from anywhere. `None` means the provider is unwired and the
+    # payload renders "unknown", never a reassuring guess.
+    #
+    # NOTE: `exec_mode` and `exec_shadow` are ORTHOGONAL. A PAUSED engine is neither
+    # shadow nor live; inferring one from the other is a category error.
+    shadow_fn: Callable[[], bool | None] | None = None
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
     _started_at: datetime | None = None
 
@@ -76,6 +87,16 @@ class HealthReporter:
     def _uptime_sec(self) -> float:
         assert self._started_at is not None
         return round((self.clock().astimezone(timezone.utc) - self._started_at).total_seconds(), 1)
+
+    def _exec_shadow(self) -> bool | str:
+        """The resolved EXEC_SHADOW, or the string "unknown" if nothing is wired.
+
+        Deliberately NOT defaulted to True or False: a wrong boolean here would read as a
+        confident answer about whether orders reach a real broker. "unknown" is the honest
+        rendering of an unwired provider.
+        """
+        value = self._safe(self.shadow_fn)
+        return "unknown" if value is None else bool(value)
 
     # ----- payloads ---------------------------------------------------------
     def health(self) -> dict[str, Any]:
@@ -98,6 +119,7 @@ class HealthReporter:
         return {
             "schema_version": SCHEMA_VERSION,
             "exec_mode": (self._safe(self.safety_state_fn, "unknown") or "unknown").upper(),
+            "exec_shadow": self._exec_shadow(),
             "queue_staleness_sec": self._safe(self.staleness_fn),
             "queue_staleness_limit_sec": self._safe(self.staleness_limit_fn),
             "open_positions": len(positions),
@@ -118,6 +140,8 @@ class HealthReporter:
             "service": "system-2-execution-engine",
             "uptime_sec": self._uptime_sec(),
             "exec_mode": (self._safe(self.safety_state_fn, "unknown") or "unknown").upper(),
+            # The effective EXEC_SHADOW (F-309). Orthogonal to exec_mode above.
+            "exec_shadow": self._exec_shadow(),
             "queue": {
                 "staleness_sec": self._safe(self.staleness_fn),
                 # The EFFECTIVE limit this process is running with. Exposed so the deployed
