@@ -28,7 +28,7 @@ from enum import Enum
 from typing import Any, Callable, Iterable
 
 from system2.common.logging import get_logger, log_event, set_correlation_id
-from system2.common.secrets import Secrets, get_secrets
+from system2.common.secrets import MissingSecretError, Secrets, get_secrets
 
 log = get_logger("execution.pipeline")
 
@@ -36,6 +36,39 @@ log = get_logger("execution.pipeline")
 DEFAULT_RR_RATIO = 3.0
 DEFAULT_ATR_MULTIPLIER_SL = 1.0
 DEFAULT_ATR_MULTIPLIER_TP = 3.0
+
+# --------------------------------------------------------------------------- #
+# EXEC_SHADOW — one source of truth (F-309 / OD-5)
+# --------------------------------------------------------------------------- #
+# `EXEC_SHADOW` decides whether an approved order is actually submitted to the broker
+# or merely simulated. It had TWO readers that disagreed on the default: this module
+# resolved an absent flag to False (submit for real) while `lifecycle.build_from_secrets`
+# resolved it to True (simulate). So the intent could be read from two places and give
+# two answers, and nothing exposed the RESOLVED value at all — the deployed reality was
+# unreadable without shell access (F-309). Both callers now resolve through
+# `resolve_shadow`, and the production path passes `require_explicit=True`.
+#
+# The default is True because that is the safe direction: if this is ever reached, it
+# simulates rather than sends. `exec_mode` and `EXEC_SHADOW` are ORTHOGONAL — a PAUSED
+# engine is neither shadow nor live, and reading one from the other is a category error.
+SHADOW_DEFAULT = True
+
+
+def resolve_shadow(secrets: Secrets, *, require_explicit: bool = False) -> bool:
+    """The effective ``EXEC_SHADOW``, resolved in exactly one place.
+
+    ``require_explicit=True`` refuses to guess: a flag that decides whether orders reach
+    a real broker should not be settled by whichever import happened to win, so the
+    production path treats an absent ``EXEC_SHADOW`` as a missing secret and fails closed
+    at startup rather than silently adopting a posture.
+    """
+    if require_explicit and not str(secrets.get("EXEC_SHADOW", "") or "").strip():
+        raise MissingSecretError(
+            "EXEC_SHADOW is not set. It decides whether approved orders are submitted to "
+            "the broker (false) or only simulated (true); it is too consequential to "
+            "default. Set it explicitly in .env.system2."
+        )
+    return secrets.get_bool("EXEC_SHADOW", SHADOW_DEFAULT)
 
 
 class ExecMode(str, Enum):
@@ -356,7 +389,7 @@ class ExecutionPipeline:
     ) -> None:
         self.secrets = secrets or get_secrets()
         self.mode = mode or ExecMode((self.secrets.get("EXEC_MODE", "execution_only") or "execution_only"))
-        self.shadow = self.secrets.get_bool("EXEC_SHADOW", False) if shadow is None else shadow
+        self.shadow = resolve_shadow(self.secrets) if shadow is None else shadow
         self.processed = processed_store or InMemoryProcessedStore()
         self.backup_guard = backup_guard or BackupCorrelationGuard(
             max_open_positions=self.secrets.get_int("MAX_OPEN_POSITIONS", 8)
