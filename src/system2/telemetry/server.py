@@ -13,7 +13,7 @@ from typing import Any
 from system2.telemetry.health import HealthReporter
 
 
-def build_health_app(reporter: HealthReporter, signal_producer: Any = None) -> Any:
+def build_health_app(reporter: HealthReporter) -> Any:
     """Return a FastAPI app exposing the read-only System-2 telemetry endpoints."""
     from fastapi import FastAPI  # lazy
 
@@ -36,13 +36,22 @@ def build_health_app(reporter: HealthReporter, signal_producer: Any = None) -> A
         return reporter.regime()
 
     @app.get("/signal")
-    def signal() -> dict[str, Any]:  # live scored-signal producer stats (EXEC-011)
-        if signal_producer is None:
-            return {"running": False, "reason": "signal producer not loaded"}
-        try:
-            return signal_producer.telemetry_snapshot()
-        except Exception as exc:  # telemetry must never 500 the health surface
-            return {"running": False, "reason": f"{type(exc).__name__}: {exc}"}
+    def signal() -> dict[str, Any]:
+        """EXEC-011's producer stats. The producer is gone; the route is not.
+
+        Deleting the route would make the dashboard's fetch fail, and a failed
+        fetch reads as "unreachable" — a transient fault an operator waits out.
+        This is not a fault and there is nothing to wait for: System 2 no longer
+        originates signals at all (S1-NOTICE-2026-08-15 §4.3). `removed` says so
+        in a field a consumer can branch on, rather than only in prose.
+        """
+        return {
+            "running": False,
+            "removed": True,
+            "reason": "signal production removed 2026-08-15 — System 2 is "
+                      "execution-only and originates no signals; entry logic is "
+                      "System 1's (S1-REPLY-2026-08-02b §2)",
+        }
 
     return app
 

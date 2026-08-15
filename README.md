@@ -44,7 +44,8 @@ src/system2/
   broker/                # OANDA adapter (REST), position manager, slippage validation
   execution/             # pipeline, outbound consumer, fill producer, close tracker,
                          # lifecycle wiring, safety monitor, trade recorder
-  live_signal_producer/  # bar sweep, gatekeeper scoring, dedup, signal ledger
+                         # (no signal producer: System 2 originates no signals —
+                         #  entry logic is System 1's, S1-NOTICE-2026-08-15 §4.3)
   telemetry/             # health/status HTTP surface
   common/                # config/secrets, structured logging, queue backend, db
 migrations/              # additive SQL migrations (sqlite + postgres)

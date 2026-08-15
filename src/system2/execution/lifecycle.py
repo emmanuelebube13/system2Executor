@@ -97,7 +97,6 @@ class ExecutionRuntime:
     reporter: Any = None          # HealthReporter (optional)
     adapter: Any = None           # OandaAdapter (for startup reconcile + flatten-on-stop)
     regime_scheduler: Any = None  # RegimeScheduler (optional; fail-open, never blocks trading)
-    signal_producer: Any = None   # LiveSignalProducer (EXEC-011; optional, fail-open)
     close_sweeper: Any = None     # CloseSweeper (EXEC-012; optional, fail-open, self-throttled)
     close_emitter: Any = None     # CloseEmitter (EXEC-012; close events for flatten-on-stop)
     price_source_fn: Callable[[], dict[str, float]] | None = None
@@ -167,12 +166,6 @@ class ExecutionRuntime:
                 self.regime_scheduler.start()
             except Exception as exc:  # regime is best-effort; never block trading start
                 log_event(log, logging.ERROR, "regime scheduler failed to start", error=str(exc))
-        if self.signal_producer is not None:
-            try:
-                threading.Thread(target=self.signal_producer.run_forever,
-                                 name="live-signals", daemon=True).start()
-            except Exception as exc:  # signal production is best-effort; never block trading
-                log_event(log, logging.ERROR, "live signal producer failed to start", error=str(exc))
         log_event(log, logging.INFO, "execution runtime started")
         n = 0
         while not self.emergency_stop.is_stopped():
@@ -196,12 +189,6 @@ class ExecutionRuntime:
             try:
                 self.regime_scheduler.stop()
             except Exception:  # best-effort; shutdown must not be blocked by telemetry
-                pass
-
-        if self.signal_producer is not None:
-            try:
-                self.signal_producer.shutdown()
-            except Exception:  # best-effort; shutdown must not be blocked by signals
                 pass
 
         flushed = 0
@@ -377,22 +364,17 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
         except Exception as exc:  # never let regime setup block startup of the trading path
             log_event(log, logging.ERROR, "regime detector disabled (setup failed)", error=str(exc))
 
-    # Live scored-signal producer (EXEC-011). Rides on the regime detector; publishes to
-    # the scored-signals topic only when LIVE_SIGNAL_ENABLED=true (shadow-logs otherwise).
-    # Fail-open like the regime scheduler: it never blocks or crashes the trading path.
-    signal_producer = None
-    if regime_scheduler is not None:
-        try:
-            from system2.live_signal_producer import LiveSignalProducer
-
-            signal_producer = LiveSignalProducer(
-                artifact_root=Path(secrets.require("ARTIFACT_ROOT")),
-                queue=queue,
-                regime_detector=regime_scheduler.detector,
-                secrets=secrets,
-            )
-        except Exception as exc:  # never let signal setup block startup of the trading path
-            log_event(log, logging.ERROR, "live signal producer disabled (setup failed)", error=str(exc))
+    # EXEC-011's live scored-signal producer used to be built here. It was DELETED on
+    # 2026-08-15 (S1-NOTICE-2026-08-15 §4.3), not disabled: it fabricated an order's
+    # direction from the regime label — Trending-Down ⇒ short, every polling cycle,
+    # for every instrument — with no entry condition of any kind behind it. Correcting
+    # its arithmetic would have produced correctly-signed orders for trades that have
+    # no setup, which is worse, because it would look right.
+    #
+    # System 1 owns entry logic (S1-REPLY-2026-08-02b §2). System 2 is execution-only:
+    # it acts on scored signals it receives and originates none. Do not reintroduce a
+    # local signal source here; when there is something to transport, the schema
+    # conversation happens first.
 
     # Active model set id for the health surface: the downloader's state.json is the
     # authority (works even when regime/signal components are disabled).
@@ -405,16 +387,14 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
         except Exception:
             return None
 
-    # The gatekeeper's runtime approval-rate band (F-602, FIX_PLAN 2.1(d)). Reads through the
-    # producer when one was built; `None` when it was not, which the reporter renders as an
-    # explicit "unavailable" rather than a false all-clear.
-    def _gatekeeper_approval() -> dict[str, Any] | None:
-        p = signal_producer
-        mon = getattr(p, "approval_monitor", None) if p is not None else None
-        return mon.snapshot() if mon is not None else None
+    # The gatekeeper's runtime approval-rate band (F-602, FIX_PLAN 2.1(d)) used to read
+    # through the producer's approval monitor. With the producer deleted nothing in this
+    # process evaluates signals, so there is no approval rate to report and the hook is
+    # left unwired — the reporter renders that as an explicit "unavailable", which is the
+    # truth, rather than a false all-clear. MODEL-006 rewires it when the gatekeeper is
+    # rebuilt (S1-NOTICE-2026-08-15 §4.4: honest strategies first, gatekeeper second).
 
     reporter = HealthReporter(
-        gatekeeper_approval_fn=_gatekeeper_approval,
         safety_state_fn=lambda: monitor.state.value,
         model_set_id_fn=_active_model_set_id,
         staleness_fn=lambda: monitor.staleness_seconds(monitor.clock(), consumer.lag.last_message_at),
@@ -440,7 +420,7 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
     return ExecutionRuntime(
         consumer=consumer, monitor=monitor, position_manager=position_manager,
         producer=producer, emergency_stop=stop, reporter=reporter, adapter=adapter,
-        regime_scheduler=regime_scheduler, signal_producer=signal_producer,
+        regime_scheduler=regime_scheduler,
         close_sweeper=close_sweeper, close_emitter=close_emitter,
         reconcile_fn=_reconcile,
         flatten_on_stop=secrets.get_bool("EXEC_STOP_FLATTEN", False),

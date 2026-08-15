@@ -39,18 +39,21 @@ def test_migrations_apply_then_noop(tmp_path):
         conn.close()
 
 
-def test_postgres_config_failcloses_without_dsn(monkeypatch):
+def test_postgres_config_failcloses_without_dsn(monkeypatch, tmp_path):
     from system2.common.secrets import MissingSecretError, Secrets
 
     monkeypatch.setenv("DB_PROVIDER", "postgres")
     monkeypatch.delenv("DB_DSN", raising=False)
+    # `Secrets` merges os.environ OVER a dotenv file, so deleting the env var is
+    # not enough — on a developer box config/.env.system2 supplies DB_DSN and the
+    # fail-closed path was never reached. Point it at a file that does not exist.
     with pytest.raises(MissingSecretError):
-        DbConfig.from_secrets(Secrets())
+        DbConfig.from_secrets(Secrets(env_file=tmp_path / "absent.env"))
 
 
-def test_unknown_provider_rejected(monkeypatch):
+def test_unknown_provider_rejected(monkeypatch, tmp_path):
     from system2.common.secrets import Secrets
 
     monkeypatch.setenv("DB_PROVIDER", "oracle")
     with pytest.raises(ValueError):
-        DbConfig.from_secrets(Secrets())
+        DbConfig.from_secrets(Secrets(env_file=tmp_path / "absent.env"))
