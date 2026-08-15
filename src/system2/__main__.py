@@ -31,7 +31,7 @@ def _start_health_server(runtime, secrets) -> None:
     try:
         from system2.telemetry.server import build_health_app, run_server
 
-        app = build_health_app(runtime.reporter, signal_producer=runtime.signal_producer)
+        app = build_health_app(runtime.reporter)
         t = threading.Thread(
             target=run_server, args=(app,), kwargs={"secrets": secrets},
             name="health-server", daemon=True,
