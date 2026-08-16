@@ -94,3 +94,40 @@
 - **Recorded-by:** ORCHESTRATOR-v2
 - **Affected:** blocks any `/reset_breaker`; gates FIX_PLAN Group 1 verification strategy;
   interacts with D-004 and with owner decisions OD-3/OD-4 in `audit/state/orchestrator-state.json`.
+
+---
+
+### D-006 — Security hardening is deferred until the account holds real money
+- **Timestamp (UTC):** 2026-08-15
+- **Status:** ✅ DECIDED — accept the current exposure; revisit on a named trigger.
+- **Question:** EXEC-4 surfaced two security items needing an owner decision: the Cloud Run
+  dashboard is invokable by `allUsers` (S2-17), and an exported `system1-rw@` key with
+  `objectAdmin` on the artifact bucket sits on the trading VM (F-601b / S2-26). Fix now, or defer?
+- **Chosen:** **Defer both. Do nothing for now.** No IAM change, no key rotation, no ingress
+  change. Engineering effort goes to the money path instead.
+- **Rationale (owner's, recorded as given):** the broker account is OANDA **practice**, not real
+  capital; access to the environment is limited to the owner; and the system is still being built
+  toward its core purpose — *make money and conserve money*. Security work that does not move that
+  purpose forward is not the best use of the next block of effort. The residual risk was
+  quantified before deciding, not assumed: an unauthenticated caller reaches the static dashboard
+  bundle and **nothing else** (all five `/api/*` endpoints return 401, verified 2026-08-15), and
+  the remote-code-execution path is gone.
+- **REVISIT TRIGGER (owner-named, binding):** **before** the account is switched from practice to
+  real money. This is the same gate as D-004 (shadow→live cutover). Treat D-006 as a blocking
+  prerequisite of D-004: the cutover checklist must not be signed off while D-006 is still
+  "deferred". Also revisit if the environment ever gains a second human user, or if the dashboard
+  is shared outside the owner.
+- **What is knowingly accepted:**
+  1. The dashboard stays permanently reachable from the internet, so any *future* regression that
+     re-registers a write endpoint is immediately public. This has happened once (the chat
+     endpoint stayed live eight days after being reported fixed) — the exposure is what turned a
+     code mistake into a public one.
+  2. A credential that can **delete** the model-artifact store sits on the VM at mode `0666`. The
+     realistic failure here is not an attacker but an accident or a bug exercising delete rights;
+     the cost would be a rebuild/republish from System 1, not a capital loss.
+  3. F-601 (`trading-vm@` → `objectViewer`) is consequently **also parked**, since executing it
+     alone would report a privilege reduction that does not exist (see F-601b).
+- **Decided-by:** Emmanuel (human) — 2026-08-15, in response to the EXEC-4 report.
+- **Recorded-by:** EXEC-4
+- **Affected:** parks S2-17, S2-18/F-601, S2-26/F-601b. Does **not** affect D-005 (breaker stays
+  closed). Blocks sign-off of D-004 until reopened.
