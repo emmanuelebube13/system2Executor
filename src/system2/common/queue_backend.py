@@ -106,6 +106,69 @@ class QueueBackend(Protocol):
 # --------------------------------------------------------------------------- #
 # Local durable backend (SQLite) — dev/test, same interface
 # --------------------------------------------------------------------------- #
+class SharedQueueMissing(RuntimeError):
+    """``QUEUE_LOCAL_PATH`` did not resolve to the shared queue.db System 3 also writes.
+
+    P0: ``sqlite3.connect`` creates an empty database at *any* path it is handed, and
+    ``__init__`` mkdir's the parent first, so a mistyped, relative, or wrong-platform
+    ``QUEUE_LOCAL_PATH`` produced a brand-new private queue instead of an error. Every
+    pull then returned nothing, forever, and the process looked healthy: "no orders" and
+    "not connected to the order queue" were the same observation.
+
+    Raised *before* connecting, so the empty file is never created in the first place.
+    """
+
+
+def _assert_shared_queue(path: Path) -> None:
+    """Refuse to open ``path`` unless it is an already-populated shared queue.db.
+
+    Three checks, each a failure actually seen or reachable:
+
+    * **exists** — the shared queue is created by whoever starts first and lives across
+      restarts; System 2 joining a live system never legitimately creates it.
+    * **non-empty** — a 0-byte file is the fingerprint of a previous silent-create (there
+      is one at the repo root, dated 2026-08-16, from exactly this bug).
+    * **has the ``queue`` table** — catches a same-named file that is not a queue at all,
+      including the literal ``C:\\Users\\...`` file a Windows path creates on a POSIX host.
+
+    Bootstrapping a genuinely new deployment is still possible, but only deliberately:
+    set ``QUEUE_LOCAL_ALLOW_CREATE=true``. Never set it to make this error go away —
+    the error means the path is wrong, and creating the file hides that.
+    """
+    resolved = path.expanduser().resolve()
+    hint = (
+        f"resolved QUEUE_LOCAL_PATH -> {resolved}"
+        f"{'' if str(resolved) == str(path) else f' (from {path!r})'}"
+    )
+    if not resolved.exists():
+        raise SharedQueueMissing(
+            f"shared queue.db does not exist: {hint}. System 2 does not create the shared "
+            "queue — point QUEUE_LOCAL_PATH at the file System 3 and the bridge use, or set "
+            "QUEUE_LOCAL_ALLOW_CREATE=true if this really is a new deployment."
+        )
+    if not resolved.is_file():
+        raise SharedQueueMissing(f"shared queue path is not a file: {hint}")
+    if resolved.stat().st_size == 0:
+        raise SharedQueueMissing(
+            f"shared queue.db is 0 bytes: {hint}. That is an empty database created by a "
+            "wrong QUEUE_LOCAL_PATH, not the shared queue."
+        )
+    try:
+        conn = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+        try:
+            found = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='queue'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as exc:
+        raise SharedQueueMissing(f"shared queue.db is not a readable SQLite database: {hint}") from exc
+    if found is None:
+        raise SharedQueueMissing(
+            f"file has no 'queue' table, so it is not the shared queue.db: {hint}"
+        )
+
+
 class LocalDurableBackend:
     """File-backed durable queue. ``topic`` == ``subscription`` name. DLQ = ``<topic>.dlq``."""
 
@@ -115,8 +178,11 @@ class LocalDurableBackend:
         max_attempts: int = 5,
         lease_sec: float = DEFAULT_LEASE_SEC,
         owner: str | None = None,
+        require_existing: bool = False,
     ) -> None:
         self.path = Path(db_path)
+        if require_existing:
+            _assert_shared_queue(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.max_attempts = max_attempts
         self.lease_sec = float(lease_sec)
@@ -136,9 +202,11 @@ class LocalDurableBackend:
                 available_at REAL NOT NULL DEFAULT 0,
                 ack_id TEXT,
                 leased_until REAL NOT NULL DEFAULT 0,
-                lease_owner TEXT)"""
+                lease_owner TEXT,
+                done_at REAL)"""
         )
         self._add_lease_columns()
+        self._add_done_at_column()
 
     def _add_lease_columns(self) -> None:
         """Add the lease columns to a queue.db created before F-307 was fixed.
@@ -155,6 +223,15 @@ class LocalDurableBackend:
             try:
                 self._conn.execute(f"ALTER TABLE queue ADD COLUMN {name} {decl}")
             except sqlite3.OperationalError:  # a peer process added it between the two calls
+                pass
+
+    def _add_done_at_column(self) -> None:
+        """Add the done_at column for retention policy."""
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(queue)")}
+        if "done_at" not in cols:
+            try:
+                self._conn.execute("ALTER TABLE queue ADD COLUMN done_at REAL")
+            except sqlite3.OperationalError:
                 pass
 
     def publish(self, topic: str, body: dict[str, Any]) -> None:
@@ -370,10 +447,15 @@ def build_queue(secrets: Any | None = None) -> QueueBackend:
     provider = (secrets.get("QUEUE_PROVIDER", "pubsub") or "pubsub").lower()
     if provider == "local":
         path = secrets.get("QUEUE_LOCAL_PATH", "state/queue/queue.db")
+        # P0: this is THE shared queue.db (System 2 + System 3 + the bridge). Fail loudly
+        # rather than silently create a private empty one — see _assert_shared_queue.
+        # Only the factory asserts: LocalDurableBackend is also used for genuinely local,
+        # self-created stores (the fill outbox) and by tests with tmp_path.
         return LocalDurableBackend(
             path,
             max_attempts=secrets.get_int("QUEUE_MAX_DELIVERY_ATTEMPTS", 5),
             lease_sec=secrets.get_int("QUEUE_LEASE_SEC", int(DEFAULT_LEASE_SEC)),
+            require_existing=not secrets.get_bool("QUEUE_LOCAL_ALLOW_CREATE", False),
         )
     if provider == "pubsub":
         return PubSubBackend(

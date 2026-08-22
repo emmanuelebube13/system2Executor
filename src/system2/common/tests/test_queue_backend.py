@@ -13,6 +13,8 @@ import pytest
 
 from system2.common.queue_backend import (
     LocalDurableBackend,
+    SharedQueueMissing,
+    _assert_shared_queue,
     ReceivedMessage,
     make_envelope,
 )
@@ -190,4 +192,56 @@ def test_recovers_a_queue_db_written_before_the_lease_existed(tmp_path: Path):
     assert {"leased_until", "lease_owner"} <= cols
     msgs = q.pull("orders")
     assert [m.body for m in msgs] == [{"stranded": True}]
+    q.close()
+
+
+# --------------------------------------------------------------------------- #
+# Shared-queue assertion (P0)
+#
+# sqlite3.connect creates a database at any path it is given, so a wrong
+# QUEUE_LOCAL_PATH used to yield a private, permanently empty queue that looked
+# exactly like a quiet one. These pin the refusal to the specific shapes a wrong
+# path takes.
+# --------------------------------------------------------------------------- #
+
+def test_assert_shared_queue_accepts_a_real_queue(tmp_path: Path) -> None:
+    path = tmp_path / "queue.db"
+    LocalDurableBackend(path).close()
+    _assert_shared_queue(path)  # does not raise
+
+
+def test_assert_shared_queue_rejects_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(SharedQueueMissing, match="does not exist"):
+        _assert_shared_queue(tmp_path / "queue.db")
+
+
+def test_assert_shared_queue_rejects_zero_byte_file(tmp_path: Path) -> None:
+    """The fingerprint of a previous silent-create, not a shared queue."""
+    path = tmp_path / "queue.db"
+    path.touch()
+    with pytest.raises(SharedQueueMissing, match="0 bytes"):
+        _assert_shared_queue(path)
+
+
+def test_assert_shared_queue_rejects_a_db_without_the_queue_table(tmp_path: Path) -> None:
+    path = tmp_path / "queue.db"
+    con = sqlite3.connect(str(path), isolation_level=None)
+    con.execute("CREATE TABLE something_else(x INTEGER)")
+    con.close()
+    with pytest.raises(SharedQueueMissing, match="no 'queue' table"):
+        _assert_shared_queue(path)
+
+
+def test_require_existing_refuses_before_creating_the_file(tmp_path: Path) -> None:
+    """The file must not exist afterwards — refusing after creating it is no refusal."""
+    path = tmp_path / "nested" / "queue.db"
+    with pytest.raises(SharedQueueMissing):
+        LocalDurableBackend(path, require_existing=True)
+    assert not path.exists()
+    assert not path.parent.exists()
+
+
+def test_require_existing_defaults_off_so_local_stores_still_self_create(tmp_path: Path) -> None:
+    """The fill outbox and tests legitimately create their own db."""
+    q = LocalDurableBackend(tmp_path / "outbox.db")
     q.close()
