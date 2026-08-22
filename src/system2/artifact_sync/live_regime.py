@@ -14,6 +14,7 @@ serialized bundle, never re-derived here.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -124,6 +125,8 @@ class LiveRegimeDetector:
         self.high_conf = float(self.secrets.get("REGIME_HIGH_CONF", "0.90") or 0.90)
         self._bundle: dict[str, Any] | None = None
         self._bundle_source: str | None = None  # "active" | "last_good"
+        self._bundle_set_id: str | None = None   # the set the in-memory bundle came from
+        self._seen_set_id: str | None = None     # the set last observed on disk (P2)
         self._debouncers: dict[tuple[str, str], OnlineDebouncer] = {}
         self._last_obs: dict[tuple[str, str], RegimeObservation] = {}
 
@@ -143,13 +146,78 @@ class LiveRegimeDetector:
         except OSError:
             return None
 
+    def _withdrawal(self) -> dict[str, Any] | None:
+        """The downloader's recorded withdrawal, or None (F-107).
+
+        Unreadable/absent state is NOT treated as a withdrawal: this runs on every load and a
+        transient read error must not halt regime inference. The downloader is the component
+        that fails closed on the pointer; this is the consumer honouring what it recorded.
+        """
+        try:
+            state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return state if state.get("withdrawn") is True else None
+
+    def _on_disk_set_id(self) -> str | None:
+        """The model set ``active`` points at right now, or None if there is no active link.
+
+        Read on every load so a swap is noticed. Falls back to ``last_good`` only when
+        ``active`` is absent, mirroring the source walk below — otherwise a detector serving
+        from ``last_good`` would compare against ``active`` and reload on every single call.
+        """
+        for link in (self.root / "active", self.root / "last_good"):
+            if link.exists():
+                return self._model_set_id(link)
+        return None
+
     def load_bundle(self, force: bool = False) -> bool:
         """Load the regime bundle from ``active``, falling back to ``last_good``.
 
         Returns True if a bundle is loaded. Raises nothing — failure is logged + alerted.
+
+        P2: the cache is keyed on the model set id, not merely on "a bundle is loaded".
+        It used to return early whenever ``self._bundle`` was set, and no production caller
+        ever passed ``force=True`` — so the downloader's atomic swap replaced the files on
+        disk and the long-lived detector kept inferring from the set it loaded at startup,
+        for as long as the process ran. That is how live regime labels came to be stamped
+        with a model set older than the active one, with nothing logged: the swap worked,
+        and the only consumer never looked again.
+
+        It also makes P4 meaningful rather than merely passing. A reference-vector replay
+        run after a sync would exercise the freshly downloaded bundle while production kept
+        serving the stale in-memory one, so the gate would prove a property of a bundle that
+        was not the one inferring. Reloading on swap is what ties the replay to what runs.
         """
+        on_disk = self._on_disk_set_id()
         if self._bundle is not None and not force:
-            return True
+            # Compare against the id last *observed on disk*, not the id actually loaded.
+            # They differ when `active` is unloadable and we fell back to `last_good`: then
+            # the loaded id is last_good's while disk reads active's, and comparing the two
+            # would re-attempt the broken load on every detect() call. A new swap changes
+            # the observed id and does trigger the reload.
+            if on_disk is None or on_disk == self._seen_set_id:
+                return True
+            log_event(log, logging.INFO, "model set changed on disk; reloading regime bundle",
+                      loaded=self._bundle_set_id, on_disk=on_disk)
+        self._seen_set_id = on_disk
+
+        # F-107: refuse a withdrawn model set. This check MUST come before the
+        # active -> last_good walk below, not instead of it: `last_good` points at whatever
+        # was active before the last swap, which for a withdrawal is the withdrawn set
+        # itself. Skipping `active` would silently reload the same bundle from `last_good`
+        # and report only "using last_good".
+        wd = self._withdrawal()
+        if wd is not None:
+            self._bundle = None
+            self._bundle_source = None
+            log_event(log, logging.CRITICAL,
+                      "model set is WITHDRAWN — refusing to load any regime bundle",
+                      withdrawn_at=wd.get("withdrawn_at"),
+                      model_set_id=wd.get("withdrawn_model_set_id"),
+                      detail=wd.get("withdrawn_reason"))
+            return False
+
         for source, link in (("active", self.root / "active"), ("last_good", self.root / "last_good")):
             path = self._find_artifact(link)
             if path is None:

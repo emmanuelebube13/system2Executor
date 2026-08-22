@@ -216,3 +216,75 @@ def test_corrupt_active_falls_back_to_last_good(tmp_path):
     obs = det.detect("EUR_USD", "H1")
     assert obs.smoothed_label in M.SEMANTIC_ORDER  # served from last_good
     assert det._bundle_source == "last_good"
+
+
+# ----- P2: reload on bundle swap --------------------------------------------------
+#
+# load_bundle used to return early whenever a bundle was in memory, and nothing in
+# production ever passed force=True. The downloader's atomic swap therefore replaced the
+# files while a long-lived detector kept inferring from the set it loaded at startup --
+# silently, because the swap itself worked. It also made a post-sync reference-vector
+# replay meaningless: the replay would exercise the new bundle while production served
+# the old one.
+
+def test_detector_reloads_when_the_active_set_is_swapped(detector):
+    det, root, _src = detector
+    assert det.load_bundle()
+    assert det._bundle_set_id == "set-A"
+    first = det._bundle
+
+    _install_bundle(root, "set-B", _train_bundle("H1"))     # atomic swap, as the downloader does
+
+    assert det.load_bundle()
+    assert det._bundle_set_id == "set-B", "detector kept serving the pre-swap bundle"
+    assert det._bundle is not first, "bundle object was not replaced"
+
+
+def test_detect_picks_up_a_swap_without_an_explicit_force(detector):
+    """The production path calls detect() -> load_bundle() with no force argument."""
+    det, root, _src = detector
+    det.detect("EUR_USD", "H1")
+    assert det._bundle_set_id == "set-A"
+
+    _install_bundle(root, "set-B", _train_bundle("H1"))
+
+    obs = det.detect("EUR_USD", "H1")
+    assert det._bundle_set_id == "set-B"
+    assert obs.model_set_id == "set-B", "observations were stamped with the stale set"
+
+
+def test_no_reload_when_the_set_is_unchanged(detector):
+    """The cache must still work — a reload per detect() would be a real cost."""
+    det, _root, _src = detector
+    assert det.load_bundle()
+    first = det._bundle
+    for _ in range(5):
+        assert det.load_bundle()
+    assert det._bundle is first, "bundle was reloaded despite no swap"
+
+
+def test_serving_from_last_good_does_not_reload_every_call(detector, monkeypatch):
+    """active unloadable -> we serve last_good, but must not retry the broken load forever.
+
+    The loaded id (last_good's) and the on-disk id (active's) legitimately differ here, so
+    comparing those two directly would re-attempt the corrupt joblib.load on every call.
+    """
+    det, root, _src = detector
+    _install_bundle(root, "set-good", _train_bundle("H1"), link_name="last_good")
+    (root / "sets" / "set-A" / "regime_hmm.pkl").write_bytes(b"not a joblib file")
+
+    assert det.load_bundle()
+    assert det._bundle_source == "last_good"
+    assert det._bundle_set_id == "set-good"
+
+    calls: list[str] = []
+    real_load = joblib.load
+
+    def counting_load(path, *a, **kw):
+        calls.append(str(path))
+        return real_load(path, *a, **kw)
+
+    monkeypatch.setattr("system2.artifact_sync.live_regime.joblib.load", counting_load)
+    for _ in range(5):
+        assert det.load_bundle()
+    assert calls == [], f"re-attempted the broken load {len(calls)} times"
