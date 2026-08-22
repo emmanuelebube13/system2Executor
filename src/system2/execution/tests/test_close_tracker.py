@@ -744,6 +744,8 @@ def test_backfill_emits_only_the_missing_close(tmp_path, monkeypatch):
     pre.close()
     _patch_backfill_env(monkeypatch, FakeSecrets({
         "QUEUE_PROVIDER": "local", "QUEUE_LOCAL_PATH": str(queue_path),
+        # a tmp_path queue IS a new deployment - the one case the guard allows
+        "QUEUE_LOCAL_ALLOW_CREATE": "true",
         "FILL_OUTBOX_PATH": str(outbox_path),
         "CLOSE_LEDGER_PATH": str(ledger_path),
         "S3_CLOSE_TOPIC": S3_TOPIC,
@@ -772,6 +774,8 @@ def test_backfill_dry_run_emits_nothing_and_writes_no_ledger(tmp_path, monkeypat
     ledger_path = tmp_path / "close_sweep.db"
     _patch_backfill_env(monkeypatch, FakeSecrets({
         "QUEUE_PROVIDER": "local", "QUEUE_LOCAL_PATH": str(queue_path),
+        # a tmp_path queue IS a new deployment - the one case the guard allows
+        "QUEUE_LOCAL_ALLOW_CREATE": "true",
         "FILL_OUTBOX_PATH": str(outbox_path),
         "CLOSE_LEDGER_PATH": str(ledger_path),
         "S3_CLOSE_TOPIC": S3_TOPIC,
@@ -1037,6 +1041,8 @@ def test_backfill_recovers_the_close_when_get_trade_404s(tmp_path, monkeypatch, 
     ledger_path = tmp_path / "close_sweep.db"
     secrets = FakeSecrets({
         "QUEUE_PROVIDER": "local", "QUEUE_LOCAL_PATH": str(queue_path),
+        # a tmp_path queue IS a new deployment - the one case the guard allows
+        "QUEUE_LOCAL_ALLOW_CREATE": "true",
         "FILL_OUTBOX_PATH": str(outbox_path), "CLOSE_LEDGER_PATH": str(ledger_path),
         "S3_CLOSE_TOPIC": S3_TOPIC,
     })
