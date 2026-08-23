@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import joblib
@@ -288,3 +289,73 @@ def test_serving_from_last_good_does_not_reload_every_call(detector, monkeypatch
     for _ in range(5):
         assert det.load_bundle()
     assert calls == [], f"re-attempted the broken load {len(calls)} times"
+
+
+# ----- feature contract (the 2026-08-23 atr_pct_14 incident) ----------------------
+#
+# System 1 bumped feature_set_version to 1.1.0 and the vector became
+# ["atr_pct_14", ...]. System 2 produced atr_14. The mismatch surfaced as a KeyError
+# once per inference call -- WARNING, swallowed -- so 100% of regime detections failed
+# while the service reported itself healthy. It only became visible when the P2 cache
+# fix stopped it serving a four-day-stale bundle whose contract happened to match.
+
+def test_atr_pct_is_atr_over_close_and_dimensionless():
+    """The normalisation is the point: comparable across a 0.7 AUD_USD and a 159 USD_JPY."""
+    cheap = _make_candles(120, seed=3, vol=0.001)
+    dear = cheap.copy()
+    for col in ("open", "high", "low", "close"):
+        dear[col] = dear[col] * 145.0          # same shape, ~145x the price
+
+    fc = compute_regime_features(cheap)
+    fd = compute_regime_features(dear)
+
+    assert np.allclose(fc["atr_pct_14"].dropna().to_numpy(),
+                       (fc["atr_14"] / fc["close"]).dropna().to_numpy(), rtol=1e-12)
+    # absolute ATR scales with price; the normalised one does not
+    assert fd["atr_14"].iloc[-1] == pytest.approx(fc["atr_14"].iloc[-1] * 145.0, rel=1e-9)
+    assert fd["atr_pct_14"].iloc[-1] == pytest.approx(fc["atr_pct_14"].iloc[-1], rel=1e-9)
+    # warm-up inherited from atr_14, not invented
+    assert fc["atr_pct_14"].isna().sum() == fc["atr_14"].isna().sum()
+
+
+def test_bundle_wanting_an_unproducible_feature_is_refused_at_load(detector):
+    """Refuse at load, not once per inference.
+
+    The failure being per-call is what made it survivable-looking: a WARNING every sweep,
+    no CRITICAL, and a service that considered itself up while producing no regimes at all.
+    """
+    det, root, _src = detector
+    bundle = _train_bundle("H1")
+    bundle["feature_names"] = ["atr_pct_14", "adx_14", "no_such_feature_v9"]
+    bundle["feature_set_version"] = "9.9.9"
+    _install_bundle(root, "set-future", bundle)
+
+    # The system2 root logger sets propagate=False and binds sys.stdout at configure
+    # time, so neither caplog nor capsys sees it. Attach our own handler.
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record): records.append(record)
+
+    lg = logging.getLogger("system2.artifact_sync.live_regime")
+    h = _Collect()
+    lg.addHandler(h)
+    try:
+        assert det.load_bundle() is False, "a bundle we cannot satisfy must not load"
+    finally:
+        lg.removeHandler(h)
+
+    assert det._bundle is None
+    # and it says WHICH feature, at CRITICAL -- the old failure was a per-call WARNING
+    crit = [r for r in records if r.levelno >= logging.CRITICAL]
+    assert crit, "an unsatisfiable feature contract must be CRITICAL, not a warning"
+    assert any("no_such_feature_v9" in str(getattr(r, "context", "")) for r in crit)
+
+
+def test_a_satisfiable_bundle_still_loads(detector):
+    det, root, _src = detector
+    bundle = _train_bundle("H1")
+    bundle["feature_names"] = ["atr_pct_14", "adx_14", "volatility_20", "returns_1", "trend_20"]
+    _install_bundle(root, "set-current", bundle)
+    assert det.load_bundle() is True
+    assert det._bundle_set_id == "set-current"
