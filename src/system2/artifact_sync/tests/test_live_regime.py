@@ -359,3 +359,44 @@ def test_a_satisfiable_bundle_still_loads(detector):
     _install_bundle(root, "set-current", bundle)
     assert det.load_bundle() is True
     assert det._bundle_set_id == "set-current"
+
+
+# ----- weights come from the NAMED contract ---------------------------------------
+
+def _bundle_with_named_weights(order=None):
+    b = _train_bundle("H1")
+    names = order or FEATURE_NAMES
+    b["feature_names"] = list(names)
+    b["feature_weights"] = dict(zip(FEATURE_NAMES, WEIGHTS))
+    b["models"]["H1"]["weights"] = [b["feature_weights"][n] for n in names]
+    return b
+
+
+def test_weights_are_read_by_name(detector, tmp_path):
+    det, root, _src = detector
+    _install_bundle(root, "set-named", _bundle_with_named_weights())
+    assert det.load_bundle()
+    w = det._weights_for(det._bundle["models"]["H1"])
+    assert w.tolist() == [dict(zip(FEATURE_NAMES, WEIGHTS))[n]
+                          for n in det._bundle["feature_names"]]
+
+
+def test_disagreeing_weight_copies_are_refused(detector):
+    """The two copies must not be allowed to drift apart silently."""
+    det, root, _src = detector
+    b = _bundle_with_named_weights()
+    b["models"]["H1"]["weights"] = [9.0] * len(b["feature_names"])   # positional drifts
+    _install_bundle(root, "set-drift", b)
+    assert det.load_bundle()
+    with pytest.raises(ValueError, match="weights disagree"):
+        det._weights_for(det._bundle["models"]["H1"])
+
+
+def test_positional_weights_still_work_without_the_named_map(detector):
+    """Older bundles carry only the positional list."""
+    det, root, _src = detector
+    b = _train_bundle("H1")
+    b.pop("feature_weights", None)
+    _install_bundle(root, "set-legacy", b)
+    assert det.load_bundle()
+    assert det._weights_for(det._bundle["models"]["H1"]).tolist() == WEIGHTS

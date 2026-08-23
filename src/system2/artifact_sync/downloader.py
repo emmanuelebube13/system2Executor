@@ -74,6 +74,53 @@ class Manifest:
         )
 
 
+class Withdrawn(Exception):
+    """System 1 has withdrawn the model set — an INSTRUCTION, not a malformed manifest.
+
+    F-107: a withdrawal manifest carries ``status="withdrawn"``, ``model_set_id: null`` and an
+    empty ``artifacts`` list. ``Manifest.parse`` rejected that as a ``ValueError`` and
+    ``poll_once`` caught every parse failure as a transient storage problem ("keeping active
+    set"), so the one signal designed to STOP trading took the same branch as a network blip.
+    Production served a model set disqualified for look-ahead for 31 hours after it was
+    withdrawn, reporting only a routine-looking WARNING every 15 minutes.
+
+    This is raised so the caller can distinguish "I could not read the pointer" from "the
+    publisher has told me to stop", which must never share a code path again.
+    """
+
+    def __init__(self, reason: str, withdrawn_at: str, supersedes: str | None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.withdrawn_at = withdrawn_at
+        self.supersedes = supersedes
+
+
+def parse_withdrawal(text: str) -> "Withdrawn | None":
+    """Return a :class:`Withdrawn` if ``text`` is a withdrawal manifest, else None.
+
+    Recognised by an explicit ``status`` that is not a live state. The empty-``artifacts``
+    shape alone is NOT enough to infer withdrawal — that is also what a truncated or
+    half-written manifest looks like, and guessing "withdrawn" from damage would let a
+    corrupt file silently halt trading. The publisher states withdrawal explicitly
+    (FIX-S1-015 writes ``status`` plus a mandatory human ``reason``); anything else stays a
+    parse error and keeps the active set.
+    """
+    try:
+        d = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    status = str(d.get("status", "") or "").strip().lower()
+    if not status or status in {"published", "active"}:
+        return None
+    return Withdrawn(
+        reason=str(d.get("reason", "") or f"model set {status} by the publisher"),
+        withdrawn_at=str(d.get("withdrawn_at", "") or _utc_now()),
+        supersedes=(str(d["supersedes"]) if d.get("supersedes") else None),
+    )
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -87,13 +134,11 @@ class ModelDownloader:
         storage: StorageBackend | None = None,
         secrets: Secrets | None = None,
         manifest_key: str = MANIFEST_KEY,
-        strict: bool = True,
     ) -> None:
         self.secrets = secrets or get_secrets()
         self.storage = storage or build_storage(self.secrets)
         self.root = Path(artifact_root)
         self.manifest_key = manifest_key
-        self.strict = strict
         self.sets_dir = self.root / "sets"
         self.staging_dir = self.root / "staging"
         self.active_link = self.root / "active"
@@ -123,14 +168,18 @@ class ModelDownloader:
     # ----- core protocol ---------------------------------------------------------
     def fetch_manifest(self) -> Manifest:
         raw_text = self.storage.get_text(self.manifest_key)
+
+        # A withdrawal is checked FIRST and on the pointer we actually polled (F-107).
+        # It must not reach Manifest.parse, which would raise ValueError and be swallowed
+        # as a storage fault by poll_once.
+        withdrawal = parse_withdrawal(raw_text)
+        if withdrawal is not None:
+            raise withdrawal
+
         d = json.loads(raw_text)
-        
+
         # If the json is a pointer (like gatekeeper's latest.json), it has a 'path' but no 'artifacts'
-        if "artifacts" not in d and "path" in d:
-            # Fetch the actual manifest from the path
-            manifest_path = os.path.join(d["path"], "champion_manifest.json").replace("\\", "/")
-            raw_text = self.storage.get_text(manifest_path)
-            
+        # This branch was removed to enforce strict manifest adherence.
         return Manifest.parse(raw_text)
 
     def _download_and_verify(self, manifest: Manifest) -> Path:
@@ -167,6 +216,9 @@ class ModelDownloader:
             self._atomic_symlink(self.last_good_link, self.sets_dir / prev_active)
         self._atomic_symlink(self.active_link, final)
 
+        # Written wholesale, so the withdrawal flags from a prior poll are cleared by a
+        # successful activation (F-107): a real published set supersedes a withdrawal, and a
+        # stale `withdrawn: true` would otherwise keep consumers refusing the NEW model set.
         self._write_state(
             {
                 "active_model_set_id": manifest.model_set_id,
@@ -174,6 +226,7 @@ class ModelDownloader:
                 "published_at": manifest.published_at,
                 "last_poll_at": _utc_now(),
                 "last_swapped_at": _utc_now(),
+                "withdrawn": False,
             }
         )
 
@@ -185,6 +238,10 @@ class ModelDownloader:
             tmp.unlink()
         # Store a relative target so the artifact_root stays relocatable (cold transfer).
         os.symlink(os.path.relpath(target, link.parent), tmp)
+        
+        if os.name == 'nt' and link.is_symlink():
+            link.unlink()
+            
         os.replace(tmp, link)
 
     @staticmethod
@@ -208,6 +265,30 @@ class ModelDownloader:
         set_correlation_id(f"artifact-poll-{_utc_now()}")
         try:
             manifest = self.fetch_manifest()
+        except Withdrawn as w:
+            # F-107: an instruction to stop, NOT a fault. Record it so consumers can fail
+            # closed, and log at CRITICAL — this must never look like a routine blip again.
+            #
+            # Note what this deliberately does NOT do: it does not delete the active symlink.
+            # `live_regime.load_bundle` falls back from `active` to `last_good` (live_regime.py:153),
+            # and `last_good` is the previously-active set — i.e. the very set being withdrawn.
+            # Tearing down `active` would therefore route around the withdrawal and reload the
+            # same bundle, logging only "using last_good". The refusal has to be a state flag
+            # every consumer checks, not a filesystem removal.
+            state = self._read_state()
+            state["last_poll_at"] = _utc_now()
+            state["last_poll_error"] = None
+            state["withdrawn"] = True
+            state["withdrawn_at"] = w.withdrawn_at
+            state["withdrawn_reason"] = w.reason
+            state["withdrawn_model_set_id"] = state.get("active_model_set_id")
+            self._write_state(state)
+            log_event(
+                log, logging.CRITICAL, "model set WITHDRAWN by publisher — refusing to serve it",
+                withdrawn_at=w.withdrawn_at, supersedes=w.supersedes,
+                active=state.get("active_model_set_id"), detail=w.reason,
+            )
+            return False
         except Exception as exc:  # storage unreachable / truncated manifest
             state = self._read_state()
             state["last_poll_at"] = _utc_now()
@@ -287,7 +368,6 @@ def main() -> None:
     downloader = ModelDownloader(
         artifact_root=root,
         manifest_key=secrets.get("MANIFEST_KEY", MANIFEST_KEY),
-        strict=secrets.get_bool("MODEL_VERIFY_STRICT", True),
     )
     downloader.run_forever()
 

@@ -280,6 +280,44 @@ class LiveRegimeDetector:
         mat = feats[feature_names].to_numpy(dtype="float64")
         return mat, (as_of or "")
 
+    def _weights_for(self, model_obj: dict[str, Any]) -> np.ndarray:
+        """Post-standardisation weights, taken from the bundle's NAMED contract.
+
+        The bundle carries the same weights twice: top-level ``feature_weights`` keyed by
+        feature name, and per-granularity ``weights`` as a bare positional list. They agree
+        today. Two copies that agree until they don't is precisely the shape of the
+        ``atr_pct_14`` incident, so prefer the named one — it cannot silently transpose if
+        ``feature_names`` is reordered — and refuse when the two disagree rather than
+        picking one and hoping.
+        """
+        b = self._bundle
+        names: list[str] = list(b["feature_names"])
+        positional = model_obj.get("weights")
+        named = b.get("feature_weights")
+
+        if isinstance(named, dict):
+            missing = [n for n in names if n not in named]
+            if missing:
+                raise ValueError(f"feature_weights has no entry for {missing}")
+            w = np.asarray([float(named[n]) for n in names], dtype="float64")
+            if positional is not None:
+                pos = np.asarray(positional, dtype="float64")
+                if pos.shape != w.shape or not np.allclose(pos, w, rtol=0, atol=0):
+                    raise ValueError(
+                        "bundle weights disagree: feature_weights (by name) gives "
+                        f"{w.tolist()} for {names}, positional 'weights' gives {pos.tolist()}"
+                    )
+            return w
+
+        if positional is None:
+            raise ValueError("bundle has neither 'feature_weights' nor per-model 'weights'")
+        pos = np.asarray(positional, dtype="float64")
+        if pos.shape[0] != len(names):
+            raise ValueError(
+                f"positional weights length {pos.shape[0]} != {len(names)} feature_names"
+            )
+        return pos
+
     def _predict_probs(self, granularity: str, mat: np.ndarray) -> np.ndarray:
         """Raw-state posteriors for the LAST bar, conditioned on the whole window.
 
@@ -295,7 +333,7 @@ class LiveRegimeDetector:
         """
         model_obj = self._bundle["models"][granularity]
         scaler = model_obj["scaler"]
-        weights = np.asarray(model_obj["weights"], dtype="float64")
+        weights = self._weights_for(model_obj)
         x = scaler.transform(mat) * weights
         model = model_obj["model"]
         if hasattr(model, "predict_proba"):
