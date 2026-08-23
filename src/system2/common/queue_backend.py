@@ -119,22 +119,45 @@ class SharedQueueMissing(RuntimeError):
     """
 
 
-def _assert_shared_queue(path: Path) -> None:
-    """Refuse to open ``path`` unless it is an already-populated shared queue.db.
+def _assert_shared_queue(path: Path, expected: Path | str | None = None) -> None:
+    """Refuse to open ``path`` unless it is the shared queue.db — by identity, not shape.
 
-    Three checks, each a failure actually seen or reachable:
+    Shape checks alone are not sufficient, and assuming they were is how the first version
+    of this function would have blessed the exact file it was written to reject. On
+    ``trading-1`` the bogus queue was 4,096 bytes of valid SQLite *containing a ``queue``
+    table* — because our own code created it. It exists, it is non-empty, it is SQLite, it
+    has the table. Every shape check passes and it is still the wrong file.
 
-    * **exists** — the shared queue is created by whoever starts first and lives across
-      restarts; System 2 joining a live system never legitimately creates it.
-    * **non-empty** — a 0-byte file is the fingerprint of a previous silent-create (there
-      is one at the repo root, dated 2026-08-16, from exactly this bug).
-    * **has the ``queue`` table** — catches a same-named file that is not a queue at all,
-      including the literal ``C:\\Users\\...`` file a Windows path creates on a POSIX host.
+    So the structural checks come first and are cheap, but the load-bearing ones are:
+
+    * **absolute** — the real defect. ``C:\\Users\\...\\queue.db`` on Linux has no leading
+      ``/``, so it is not a path at all but a single *relative* filename containing
+      backslashes, resolved against the process's working directory. That is why the bogus
+      file appeared inside the application directory. A shared queue path is never relative.
+    * **no backslashes on POSIX** — a filename with backslashes is a Windows path that lost
+      its platform, never an intentional name.
+    * **same inode as ``expected``** — identity, when an expectation is configured
+      (``QUEUE_LOCAL_EXPECTED_PATH``). ``st_dev``/``st_ino`` is the only check that answers
+      "is this the same file System 3 has open?" rather than "does this look like a queue?".
 
     Bootstrapping a genuinely new deployment is still possible, but only deliberately:
     set ``QUEUE_LOCAL_ALLOW_CREATE=true``. Never set it to make this error go away —
     the error means the path is wrong, and creating the file hides that.
     """
+    raw = str(path)
+    if not path.expanduser().is_absolute():
+        raise SharedQueueMissing(
+            f"QUEUE_LOCAL_PATH is not absolute: {raw!r}. It would resolve against the "
+            f"working directory ({Path.cwd()}) and create a private queue there. A Windows "
+            "path on a POSIX host looks exactly like this — it is one relative filename, "
+            "not a path."
+        )
+    if os.sep == "/" and "\\" in raw:
+        raise SharedQueueMissing(
+            f"QUEUE_LOCAL_PATH contains backslashes on a POSIX host: {raw!r}. That is a "
+            "Windows path, and here it is just an oddly-named file."
+        )
+
     resolved = path.expanduser().resolve()
     hint = (
         f"resolved QUEUE_LOCAL_PATH -> {resolved}"
@@ -168,6 +191,26 @@ def _assert_shared_queue(path: Path) -> None:
             f"file has no 'queue' table, so it is not the shared queue.db: {hint}"
         )
 
+    # Identity. Everything above only establishes that this looks like a queue; a private
+    # queue our own code created looks like one too. st_dev/st_ino is the same-file test.
+    if expected is not None:
+        exp = Path(expected).expanduser()
+        try:
+            exp_st = exp.resolve().stat()
+        except OSError as exc:
+            raise SharedQueueMissing(
+                f"QUEUE_LOCAL_EXPECTED_PATH cannot be read: {exp} ({type(exc).__name__}). "
+                "Point it at the shared queue.db, or unset it."
+            ) from exc
+        got_st = resolved.stat()
+        if (got_st.st_dev, got_st.st_ino) != (exp_st.st_dev, exp_st.st_ino):
+            raise SharedQueueMissing(
+                f"queue is not the expected file. {hint}; expected {exp.resolve()} "
+                f"(dev/inode {exp_st.st_dev}/{exp_st.st_ino}, got {got_st.st_dev}/{got_st.st_ino}). "
+                "Same name is not same file — this is the check that catches a private "
+                "queue that merely looks correct."
+            )
+
 
 class LocalDurableBackend:
     """File-backed durable queue. ``topic`` == ``subscription`` name. DLQ = ``<topic>.dlq``."""
@@ -179,10 +222,11 @@ class LocalDurableBackend:
         lease_sec: float = DEFAULT_LEASE_SEC,
         owner: str | None = None,
         require_existing: bool = False,
+        expected_path: Path | str | None = None,
     ) -> None:
         self.path = Path(db_path)
         if require_existing:
-            _assert_shared_queue(self.path)
+            _assert_shared_queue(self.path, expected_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.max_attempts = max_attempts
         self.lease_sec = float(lease_sec)
@@ -456,6 +500,7 @@ def build_queue(secrets: Any | None = None) -> QueueBackend:
             max_attempts=secrets.get_int("QUEUE_MAX_DELIVERY_ATTEMPTS", 5),
             lease_sec=secrets.get_int("QUEUE_LEASE_SEC", int(DEFAULT_LEASE_SEC)),
             require_existing=not secrets.get_bool("QUEUE_LOCAL_ALLOW_CREATE", False),
+            expected_path=secrets.get("QUEUE_LOCAL_EXPECTED_PATH") or None,
         )
     if provider == "pubsub":
         return PubSubBackend(
