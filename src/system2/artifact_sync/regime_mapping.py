@@ -39,11 +39,37 @@ def map_states_to_labels(
 
 
 def order_probabilities(posteriors: np.ndarray, mapping: Dict[int, str]) -> np.ndarray:
-    """Reorder raw state posteriors into SEMANTIC_ORDER columns."""
-    semantic_to_state = {v: k for k, v in mapping.items()}
-    return np.column_stack(
-        [posteriors[:, semantic_to_state[label]] for label in SEMANTIC_ORDER]
-    )
+    """Aggregate raw state posteriors into SEMANTIC_ORDER columns.
+
+    ``mapping`` is state index -> label and is **many-to-one**: a model can put two states
+    on ``Ranging`` and none on ``Trending-Up``. The 2026-08-21 bundle does exactly that —
+    H4 maps ``{1: Trending-Down, 0: Ranging, 2: High-Vol, 3: Ranging}``.
+
+    This used to invert it with ``{v: k for k, v in mapping.items()}``, which is wrong in
+    two ways. A duplicated label silently kept only the last state, **discarding the other
+    state's probability mass** so the returned vector no longer summed to 1; and a label
+    with no state at all raised ``KeyError``. The crash was the visible half — the dropped
+    mass was the dangerous one, because it skews every confidence it does not crash on.
+
+    P(label) is the sum over the states carrying it, and a label no state carries is 0.0.
+    Every state maps to exactly one label, so the total is preserved.
+    """
+    posteriors = np.asarray(posteriors, dtype="float64")
+    n_states = posteriors.shape[1]
+    unknown = [s for s in mapping if not 0 <= int(s) < n_states]
+    if unknown:
+        raise ValueError(
+            f"mapping references states {sorted(unknown)} outside the model's "
+            f"{n_states} states"
+        )
+    columns = []
+    for label in SEMANTIC_ORDER:
+        states = [int(s) for s, lab in mapping.items() if lab == label]
+        if states:
+            columns.append(posteriors[:, states].sum(axis=1))
+        else:
+            columns.append(np.zeros(posteriors.shape[0], dtype="float64"))
+    return np.column_stack(columns)
 
 
 def persistence_smooth(labels: List[str], min_bars: int = 3) -> List[str]:
