@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from system2.artifact_sync import regime_mapping as M
-from system2.artifact_sync.features import compute_regime_features
+from system2.artifact_sync.features import compute_regime_features, produced_feature_names
 from system2.common.logging import get_logger, log_event, set_correlation_id
 from system2.common.secrets import Secrets, get_secrets
 
@@ -227,6 +227,21 @@ class LiveRegimeDetector:
                 # minimal contract check
                 if "models" not in bundle or "feature_names" not in bundle:
                     raise ValueError("bundle missing 'models'/'feature_names'")
+                # Feature-contract check, at LOAD time. The bundle is self-describing, so
+                # ask it what it wants and refuse if we cannot produce it. Without this the
+                # mismatch surfaces as a KeyError once per inference call, logged WARNING
+                # and swallowed: on 2026-08-23 that meant 100% of regime detections failing
+                # while the service reported itself healthy. A contract we cannot satisfy is
+                # a reason to refuse the bundle, not to keep asking.
+                wanted = list(bundle["feature_names"])
+                producible = produced_feature_names(bundle.get("direction_feature", "trend_20"))
+                missing = [f for f in wanted if f not in producible]
+                if missing:
+                    raise ValueError(
+                        f"bundle wants features this build cannot compute: {missing}; "
+                        f"wanted={wanted} producible={sorted(producible)} "
+                        f"feature_set_version={bundle.get('feature_set_version')!r}"
+                    )
                 self._bundle = bundle
                 self._bundle_source = source
                 self._bundle_set_id = self._model_set_id(link)

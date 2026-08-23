@@ -20,7 +20,19 @@ ADX_PERIOD = 14
 VOLATILITY_WINDOW = 20
 
 # The ordered vector MODEL-003 (HMM / K-Means) consumes (matches REGIME_FEATURE_COLUMNS).
-REGIME_FEATURE_COLUMNS: List[str] = ["atr_14", "adx_14", "volatility_20", "returns_1"]
+REGIME_FEATURE_COLUMNS: List[str] = ["atr_pct_14", "adx_14", "volatility_20", "returns_1"]
+
+
+def produced_feature_names(direction_feature: str = "trend_20") -> frozenset[str]:
+    """Every feature :func:`compute_regime_features` emits, for load-time contract checks.
+
+    Exists so a bundle whose ``feature_names`` we cannot satisfy is refused when it is
+    loaded, rather than raising ``KeyError`` once per inference call. The 2026-08-23
+    ``atr_pct_14`` incident was the latter: a per-call WARNING, swallowed, 100% of regime
+    detections failing, and the service reporting itself healthy.
+    """
+    return frozenset({"returns_1", "atr_14", "atr_pct_14", "adx_14", "volatility_20",
+                      direction_feature})
 
 
 def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
@@ -74,6 +86,13 @@ def compute_regime_features(
     a = atr(high, low, close, ATR_PERIOD).astype("float64")
     a.iloc[: ATR_PERIOD - 1] = np.nan
     out["atr_14"] = a.to_numpy()
+
+    # ATR normalised by price: dimensionless, so it is comparable across a 0.7 AUD_USD and
+    # a 159 USD_JPY. That comparability is the whole point -- an absolute ATR does not
+    # error, it silently ruins the state assignment, which is what happened on 2026-08-23
+    # when feature_set_version went to 1.1.0 and this vector was not here to match.
+    # Inherits atr_14's 13-bar warm-up via the NaNs above.
+    out["atr_pct_14"] = (a / close).to_numpy()
 
     dx = adx(high, low, close, ADX_PERIOD).astype("float64")
     dx.iloc[: 2 * ADX_PERIOD - 1] = np.nan
