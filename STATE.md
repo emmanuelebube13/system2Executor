@@ -12,9 +12,10 @@ non-trading with `EXEC_SHADOW=true` permanently. Work done here is development w
 **Documents received.** All four "Read first" docs, plus the signal schema, are in
 `gs://scalable-brain-artifacts/handoff/adr001/`. P1 is unblocked.
 
-**P0 is now complete on `trading-1` itself** — see that section. The queue link is fixed and
-proven by fd identity. A new blocker surfaced in the process: a feature-contract mismatch that
-leaves System 2 with no live regime.
+**P0 is complete on `trading-1`** and the queue link is proven by fd identity. The
+feature-contract mismatch it exposed is **also resolved** — live regimes are running — but as a
+stopgap; P3 is the real fix. One finding is open with System 1: the bundle's state→label
+mapping looks degenerate.
 
 ---
 
@@ -73,7 +74,13 @@ Spec is `BUNDLE-CONSUMER-GUIDE.md` §2–§4 and `SIGNING.md`.
 - Approved in `P0-reply.md` §4, which also notes this is a **precondition for P4 being
   meaningful**, not merely a staleness fix.
 
-## P3 — Install the code bundle ⏸ NOT STARTED
+## P3 — Install the code bundle ⏸ NEXT
+
+Approved as the real fix for the feature drift (`P0-reply.md` §4 order, item 2): install
+`indicators.py` and the strategy code from `code_bundle.zip` into a **separate virtualenv**,
+compute features from System 1's implementation, and **delete the local reimplementation**
+rather than maintaining it — a second copy that currently agrees is the thing that just failed.
+Also raise the lookback past 252 bars and add D1.
 ## P4 — Determinism gate ⏸ NOT STARTED
 ## P5 — Inference and emit ⏸ NOT STARTED (schema blocker CLOSED)
 ## P6 — Cutover ⏸ NOT STARTED
@@ -128,6 +135,21 @@ System 1's side of the handoff is sound. The blockers below are all on the consu
 4. **NEW — the trading host.** Everything from P3 onward, and all of P6, belongs on
    `trading-1`, which has not been touched. See *What is owed to `trading-1`*.
 
+## §5 items checked (not changed — both are decisions, not defects)
+
+- **Watchlist 8 vs tradeable 5.** `REGIME_INSTRUMENTS` is unset, so `regime_scheduler`
+  falls back to a hardcoded `_DEFAULT_INSTRUMENTS` of 8
+  (`regime_scheduler.py:30`); `TRADEABLE_INSTRUMENTS` is 5 — `USD_CHF`, `NZD_USD`, `EUR_GBP`
+  are the extras. Setting `REGIME_INSTRUMENTS` to the tradeable 5 reconciles it in one line.
+  Left alone deliberately: it only bites after cutover, and narrowing what we *observe* is a
+  product call, not a bug fix. Recommended before P6.
+- **`gatekeeper.state: "unavailable"` with `alarm: false`**, reason
+  `"no approval-rate provider wired"`. Confirmed on `/status`. The reply is right that this is
+  the `MODEL_VERIFY_STRICT` shape — a control that is not wired reporting as not-alarming.
+  Left alone deliberately: P5 wires the monitor from `champion_manifest.json`, and flipping
+  `alarm` true now means continuous noise until then. Whether "I cannot tell" should alarm
+  before P5 is an owner call.
+
 ## `trading-1` — P0 DONE (2026-08-23)
 
 Executed against the real System 2 host. Backups in `/opt/scalablebrain/backups/p0-20260823T001605Z/`
@@ -175,7 +197,51 @@ directly on-host instead, which is stronger, but the tests should still land the
 Also still to do: stand this Windows box down explicitly as non-trading, `EXEC_SHADOW=true`
 permanent.
 
-## NEW BLOCKER — feature contract mismatch (found by the restart)
+## Feature contract — RESOLVED 2026-08-23 (stopgap; P3 is the real fix)
+
+Live regimes are running on `trading-1`: zero sweep failures, stamped
+`2026-08-21T16-29-15Z-372f6956_gk-d614163c`. It took **three** fixes, each hiding the next.
+
+1. **`atr_pct_14` added** (`5a36ad6`) — `atr_14 / close`. Dimensionless, so it is comparable
+   across a 0.7 AUD_USD and a 159 USD_JPY; that comparability is the point, which is why an
+   absolute ATR does not error, it silently ruins the state assignment. Warm-up inherited
+   from `atr_14`.
+2. **Load-time contract check** (same commit) — `load_bundle` now asks the self-describing
+   bundle what it wants and refuses at LOAD if this build cannot produce it, naming the
+   feature at CRITICAL. The original failure was a `KeyError` once per inference call,
+   WARNING, swallowed: 100% of detections failing while the service reported itself healthy.
+3. **Weights read by name** (`bbf5c7c`) — the bundle carries the same weights twice,
+   top-level `feature_weights` keyed by name and per-granularity positional `weights`. They
+   agree today. Two copies that agree until they don't is the shape of this whole incident,
+   so bind to the named one and refuse when they disagree.
+4. **Many-to-one mapping aggregation** (`9a7af96`) — the one that mattered most.
+   `order_probabilities` inverted `{state: label}` with a dict comprehension. The live
+   mapping is many-to-one: H4 is `{1: Trending-Down, 0: Ranging, 2: High-Vol, 3: Ranging}`
+   and H1 is two `Trending-Up` states with no `Ranging` at all. Inverting that **silently
+   discarded a state's probability mass** so the vector no longer summed to 1, and raised
+   `KeyError` on a label no state carried. The crash was the visible half; the dropped mass
+   was the dangerous one, because it skews every confidence it does not crash on.
+   Now: `P(label)` is the sum over states carrying it, absent labels are 0.0.
+
+### Open question for System 1 — the mapping looks degenerate
+
+With the aggregation correct, the live output is lopsided by construction:
+
+```
+H1   8/8 observations  Trending-Up   (conf 0.999-1.000)
+H4   7/8 observations  Ranging, 1 High-Vol
+```
+
+That is not the aggregation misbehaving — it faithfully reflects a mapping in which whole
+labels are **unreachable per granularity**: H1 has no `Ranging` state, H4 has no
+`Trending-Up` state, and each has a doubled label that aggregation makes dominant.
+Confidences pinned at 1.000 across four different instruments is the same smell as the
+2026-07 degenerate-`startprob_` incident already pinned by
+`test_posterior_uses_the_sequence_not_just_the_last_bar` — different mechanism, same
+outcome: a classifier that cannot express most of its label space.
+**Raise with System 1 before P5 routes on it.**
+
+## Old blocker, now historical — feature contract mismatch (found by the restart)
 
 **Regime detection on `trading-1` is failing 100%.** Zero successful detections since restart;
 64 `regime sweep item failed / KeyError: ['atr_pct_14']`.
@@ -216,6 +282,15 @@ before P1.
   machine that is not in the trading path. P5's schema blocker closed by System 1
   withdrawing v2 and conforming to v1.
 - 2026-08-22 — P2 done and committed (9ee33ca). Full suite green: 319 passed, 1 skipped.
+- 2026-08-23 — Feature contract fixed and deployed: `atr_pct_14`, a load-time contract
+  refusal, named-weight binding, and the many-to-one mapping aggregation. Live regimes
+  running on `trading-1`, zero sweep failures, current model set. Three bugs stacked behind
+  one another — each fix revealed the next.
+  Surprise: the mapping fix was a correctness bug, not just a crash. Inverting a many-to-one
+  dict was dropping probability mass on every doubled label, so confidences were wrong
+  wherever it did not happen to crash.
+  Open: the mapping itself looks degenerate — H1 cannot express Ranging, H4 cannot express
+  Trending-Up, and live output is 8/8 Trending-Up on H1 at conf ~1.000. For System 1.
 - 2026-08-23 — `trading-1`: guard hardened for identity first (the addendum's §1 was correct —
   the original checks would have blessed the bogus file), then P0 + P2 ported, queue repointed,
   bogus triple deleted, service restarted. fd 4 matches System 3. System 2 is reading System 3's
