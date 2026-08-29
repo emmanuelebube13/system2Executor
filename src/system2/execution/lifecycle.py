@@ -317,6 +317,24 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
     )
     validator = OrderValidator.from_secrets(secrets)
 
+    def _acct_ccy_per_base(instrument: str) -> float | None:
+        """Units of the account currency per 1 unit of ``instrument``'s BASE currency.
+
+        ``units`` is denominated in the base currency, so this is the single conversion the
+        notional/leverage ceilings need to compare unlike pairs on one scale. Returns ``None``
+        when the broker has no usable quote for the cross — the validator then skips those two
+        ceilings rather than applying them to a number in the wrong currency (see
+        ``OrderValidator.validate``); ``max_units_per_pair`` still bounds a runaway size.
+        """
+        base = instrument.split("_")[0]
+        if base == validator.account_currency:
+            return 1.0
+        direct = adapter.reference_price(f"{base}_{validator.account_currency}", "BUY")
+        if direct:
+            return direct
+        inverse = adapter.reference_price(f"{validator.account_currency}_{base}", "BUY")
+        return (1.0 / inverse) if inverse else None
+
     # F-306: the entry reference now comes from the BROKER's book (adapter.price_fn), not from
     # the order. What stood here returned `suggested_sl or atr` — the STOP price, or a raw ATR
     # (a distance) masquerading as a price. Since the bridge always populates suggested_sl,
@@ -345,7 +363,9 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
         submit_fn=adapter.submit,
         persist_fn=persist_fn,
         emit_fn=_emit_fill,
-        validate_fn=lambda c: (lambda r: (r.ok, r.reason))(validator.validate(c)),
+        validate_fn=lambda c: (lambda r: (r.ok, r.reason))(
+            validator.validate(c, acct_ccy_per_base=_acct_ccy_per_base(c.instrument))
+        ),
         submit_gate_fn=monitor.can_submit,
         heartbeat_fn=monitor.record_heartbeat,  # EXEC-008: S3 keepalive -> freshness (F-305)
         open_instruments_fn=lambda: [t.instrument for t in position_manager.trades.values()
@@ -399,6 +419,24 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
     # truth, rather than a false all-clear. MODEL-006 rewires it when the gatekeeper is
     # rebuilt (S1-NOTICE-2026-08-15 §4.4: honest strategies first, gatekeeper second).
 
+    def gatekeeper_provider():
+        # There is no runtime gatekeeper in THIS process to measure: signal production —
+        # and with it the approval monitor this hook used to read — was removed on
+        # 2026-08-15 (S1-NOTICE-2026-08-15 §4.4). Reporting `unavailable` with the reason
+        # is the truth. The alternative, borrowing System 1's factory `oos_approval_rate`,
+        # would put a walk-forward backtest statistic on a live runtime tile; they measure
+        # different things on different data and one is not an estimate of the other.
+        #
+        # `alarm` is False deliberately. ops_watchdog `eval_s2` pages on this flag, so a
+        # permanently-true value would re-page every REMINDER_SEC about a known, by-design
+        # gap until someone mutes the channel — taking the real alerts with it. MODEL-006
+        # replaces this with a real band when the gatekeeper is rebuilt.
+        return {
+            "state": "unavailable",
+            "alarm": False,
+            "reason": "System 2 has no runtime gatekeeper: signal production removed 2026-08-15.",
+        }
+
     reporter = HealthReporter(
         safety_state_fn=lambda: monitor.state.value,
         model_set_id_fn=_active_model_set_id,
@@ -410,6 +448,7 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
                                    for t in position_manager.trades.values() if not t.closed],
         outbox_depth_fn=lambda: outbox.depth("fill_outbox"),
         broker_env_fn=lambda: adapter.env.env,
+        gatekeeper_approval_fn=gatekeeper_provider,
         # Read off the PIPELINE, not off `secrets` — the health surface must report what
         # this process actually resolved and is running with, not what the config file
         # says it should have resolved (F-309).
