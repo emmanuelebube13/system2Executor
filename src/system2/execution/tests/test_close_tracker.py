@@ -37,7 +37,13 @@ from system2.execution.close_tracker import (
 from system2.execution.fill_producer import FillProducer, FillResult, build_outbox
 from system2.execution.lifecycle import EmergencyStop, ExecutionRuntime
 from system2.execution.outbound_consumer import OutboundConsumer, SqliteProcessedStore
-from system2.execution.pipeline import ApprovedOrder, ExecMode, ExecutionPipeline, RiskContext
+from system2.execution.pipeline import (
+    ApprovedOrder,
+    BackupCorrelationGuard,
+    ExecMode,
+    ExecutionPipeline,
+    RiskContext,
+)
 
 T0 = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
 WED = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)  # in-session
@@ -268,15 +274,18 @@ def _order_msg(**over) -> dict:
     return m
 
 
-def _consumer_rig(tmp_path):
+def _consumer_rig(tmp_path, *, max_open_positions=None):
     """Runtime-level rig mirroring build_from_secrets' EXEC-012 _emit_fill wiring."""
     out_q = LocalDurableBackend(tmp_path / "out.db")
     inbound = FakeInbound()
     producer = FillProducer(inbound, "ams-inbound", build_outbox(tmp_path / "fill_outbox.db"))
     posman = PositionManager(adapter=None, clock=lambda: WED)
     processed = SqliteProcessedStore(tmp_path / "proc.db")
+    guard = (BackupCorrelationGuard(max_open_positions=max_open_positions)
+             if max_open_positions is not None else None)
     pipe = ExecutionPipeline(mode=ExecMode.EXECUTION_ONLY, shadow=False,
-                             processed_store=processed, clock=lambda: WED)
+                             processed_store=processed, clock=lambda: WED,
+                             backup_guard=guard)
     trade_seq = iter(range(1, 100))
 
     def _submit(constructed):
@@ -347,11 +356,17 @@ def test_register_on_fill_lands_trade_in_position_manager(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# 6) Duplicate-instrument backup guard now sees session-opened trades
+# 6) The backup guard's open-position view includes session-opened trades
 # --------------------------------------------------------------------------- #
-def test_duplicate_instrument_guard_sees_session_opened_trades(tmp_path):
-    """The 2026-07-15 hole: two concurrent EUR_USD orders. The second must be blocked."""
-    rig = _consumer_rig(tmp_path)
+def test_backup_guard_counts_session_opened_trades(tmp_path):
+    """The 2026-07-15 hole: the guard must see trades opened in THIS session, not just
+    those present at startup — otherwise its ceiling is blind to its own fills.
+
+    This used to be asserted via the duplicate-instrument block. That block is gone (per-pair
+    exposure is System 3's decision), so the same wiring is now asserted through the ceiling
+    the guard still enforces.
+    """
+    rig = _consumer_rig(tmp_path, max_open_positions=1)
     rig["out_q"].publish(OUT, _order_msg(idempotency_key="k1", correlation_id="c1"))
     rig["out_q"].publish(OUT, _order_msg(idempotency_key="k2", correlation_id="c2"))
     stats = rig["consumer"].poll_once()
@@ -359,6 +374,17 @@ def test_duplicate_instrument_guard_sees_session_opened_trades(tmp_path):
     assert stats.get("rejected_backup_guard") == 1
     assert len(rig["posman"].trades) == 1          # only the first trade registered
     assert rig["out_q"].pull(OUT) == []            # rejection durably handled (ack'd)
+
+
+def test_same_instrument_re_entry_is_allowed(tmp_path):
+    """Two concurrent EUR_USD orders both execute now — System 3 approved each."""
+    rig = _consumer_rig(tmp_path)
+    rig["out_q"].publish(OUT, _order_msg(idempotency_key="k1", correlation_id="c1"))
+    rig["out_q"].publish(OUT, _order_msg(idempotency_key="k2", correlation_id="c2"))
+    stats = rig["consumer"].poll_once()
+    assert stats.get("executed") == 2
+    assert not stats.get("rejected_backup_guard")
+    assert len(rig["posman"].trades) == 2
 
 
 # --------------------------------------------------------------------------- #

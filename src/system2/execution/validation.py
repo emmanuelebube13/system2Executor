@@ -158,6 +158,7 @@ class OrderValidator:
     max_leverage: float = 30.0
     tradeable_instruments: frozenset[str] | None = None
     clock: Callable[[], datetime] | None = None
+    account_currency: str = "CAD"
 
     def _now(self) -> datetime:
         return (self.clock or (lambda: datetime.now(timezone.utc)))()
@@ -168,6 +169,7 @@ class OrderValidator:
         *,
         account_equity: float | None = None,
         open_notional: float = 0.0,
+        acct_ccy_per_base: float | None = None,
     ) -> ValidationResult:
         if self.require_stop_loss and (order.stop_loss is None or order.stop_loss == 0):
             return ValidationResult.failed("no_stop_loss", "stop-loss required but missing")
@@ -184,19 +186,33 @@ class OrderValidator:
                 "max_units_per_pair", f"|units| {units} > cap {self.max_units_per_pair}"
             )
 
-        notional = units * order.entry_price
-        if notional + open_notional > self.max_total_notional:
-            return ValidationResult.failed(
-                "max_total_notional",
-                f"notional {notional + open_notional:.2f} > cap {self.max_total_notional}",
-            )
-
-        if account_equity and account_equity > 0:
-            leverage = (notional + open_notional) / account_equity
-            if leverage > self.max_leverage:
+        # ``units * entry_price`` is denominated in the pair's QUOTE currency, which differs
+        # per instrument — so a single scalar cap was comparing unlike quantities. EUR_USD
+        # measured in USD, USD_JPY in JPY: on 2026-08-26 an order of 57,935 USD_JPY (~61k USD,
+        # ~84k CAD, sized by System 3 to risk 83.96 CAD) computed as 9,234,723 *yen* and was
+        # rejected against a 5,000,000 cap, while EUR_USD orders of comparable economic size
+        # measured ~23,000. Any JPY signal above ~31k units was structurally unreachable.
+        #
+        # ``units`` is in the pair's BASE currency, so base->account is the one conversion
+        # needed. When no rate is available the notional and leverage ceilings are skipped
+        # rather than applied to a meaningless number: ``max_units_per_pair`` above is the
+        # hard stop on a runaway size, and this whole validator is a fault backstop, not the
+        # risk decision (that is System 3's).
+        notional = units * (acct_ccy_per_base if acct_ccy_per_base else 0.0)
+        if acct_ccy_per_base:
+            if notional + open_notional > self.max_total_notional:
                 return ValidationResult.failed(
-                    "max_leverage", f"leverage {leverage:.2f}x > cap {self.max_leverage}x"
+                    "max_total_notional",
+                    f"notional {notional + open_notional:.2f} {self.account_currency} "
+                    f"> cap {self.max_total_notional}",
                 )
+
+            if account_equity and account_equity > 0:
+                leverage = (notional + open_notional) / account_equity
+                if leverage > self.max_leverage:
+                    return ValidationResult.failed(
+                        "max_leverage", f"leverage {leverage:.2f}x > cap {self.max_leverage}x"
+                    )
 
         if not is_in_session(self._now()):
             return ValidationResult.failed("out_of_session", "outside trading session window")
@@ -216,4 +232,5 @@ class OrderValidator:
             max_leverage=float(secrets.get_int("MAX_LEVERAGE", 30)),
             tradeable_instruments=instruments,
             clock=clock,
+            account_currency=(secrets.get("ACCOUNT_CURRENCY") or "CAD").strip().upper(),
         )

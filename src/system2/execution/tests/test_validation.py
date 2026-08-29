@@ -125,13 +125,40 @@ def test_units_over_cap_rejected():
 
 def test_total_notional_cap_rejected():
     v = OrderValidator(max_total_notional=1000, clock=lambda: NOW)
-    assert v.validate(_order()).code == "max_total_notional"
+    # 10000 units of EUR at 1.40 CAD/EUR = 14000 CAD > 1000 cap
+    assert v.validate(_order(), acct_ccy_per_base=1.40).code == "max_total_notional"
 
 
 def test_leverage_cap_rejected():
     v = OrderValidator(max_leverage=2.0, clock=lambda: NOW)
-    # notional = 10000 * 1.10 = 11000; equity 1000 -> 11x leverage
-    assert v.validate(_order(), account_equity=1000).code == "max_leverage"
+    # notional = 10000 units * 1.40 CAD/EUR = 14000 CAD; equity 1000 -> 14x leverage
+    assert v.validate(_order(), account_equity=1000,
+                      acct_ccy_per_base=1.40).code == "max_leverage"
+
+
+def test_notional_cap_is_currency_consistent_across_pairs():
+    """The 2026-08-26 USD_JPY reject: quote-currency notional made JPY pairs ~110x heavier.
+
+    Both orders below are the same economic size (~14,000 CAD). Under the old
+    ``units * entry_price`` the USD_JPY one measured in yen and blew any CAD-scaled cap.
+    """
+    v = OrderValidator(max_total_notional=20_000, clock=lambda: NOW)
+    eur = v.validate(_order(instrument="EUR_USD", units=10_000, entry_price=1.10),
+                     acct_ccy_per_base=1.40)
+    jpy = v.validate(_order(instrument="USD_JPY", units=10_000, entry_price=159.4,
+                            stop_loss=158.0, take_profit=163.0),
+                     acct_ccy_per_base=1.385)
+    assert eur.ok and jpy.ok
+
+
+def test_notional_and_leverage_skipped_when_no_rate_available():
+    """No usable cross -> skip those two ceilings rather than compare wrong currencies.
+
+    ``max_units_per_pair`` remains the hard stop on a runaway size.
+    """
+    v = OrderValidator(max_total_notional=1, max_leverage=0.001, clock=lambda: NOW)
+    assert v.validate(_order(), account_equity=1000, acct_ccy_per_base=None).ok
+    assert v.validate(_order(units=10_000_000), acct_ccy_per_base=None).code == "max_units_per_pair"
 
 
 def test_untradeable_instrument_rejected():

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -20,7 +20,9 @@ from system2.execution.pipeline import (
     InvalidOrderError,
     NoMarketPriceError,
     RiskContext,
+    StaleSetupError,
     _atr_stops,
+    reanchor_bracket,
     assert_protective_prices,
     is_in_session,
     legacy_atr_risk_parameters,
@@ -322,11 +324,69 @@ def test_backup_guard_rejects_past_backstop():
     assert res["decision"] is Decision.REJECTED_BACKUP_GUARD
 
 
-def test_backup_guard_rejects_duplicate_instrument():
+def test_backup_guard_allows_re_entry_into_held_instrument():
+    """Same-pair re-entry is System 3's call, not this backstop's.
+
+    The old behaviour rejected outright, which blocked every approved order on EUR_USD,
+    GBP_USD and USD_CAD for four days behind three positions opened 2026-08-24.
+    """
     pipe = ExecutionPipeline(shadow=True,
                              clock=lambda: datetime(2026, 6, 24, 12, tzinfo=timezone.utc))
     res = pipe.process(_orders()[0], 1.10000, open_instruments=["EUR_USD"])
+    assert res["decision"] is not Decision.REJECTED_BACKUP_GUARD
+
+
+def test_backup_guard_still_caps_total_positions_with_duplicates():
+    """Re-entry is allowed, but the overall ceiling still bounds it."""
+    guard = BackupCorrelationGuard(max_open_positions=2)
+    pipe = ExecutionPipeline(shadow=True, backup_guard=guard,
+                             clock=lambda: datetime(2026, 6, 24, 12, tzinfo=timezone.utc))
+    res = pipe.process(_orders()[0], 1.10000, open_instruments=["EUR_USD", "EUR_USD"])
     assert res["decision"] is Decision.REJECTED_BACKUP_GUARD
+
+
+# ----- bracket re-anchoring (entry drift) ------------------------------------------
+def test_reanchor_preserves_stop_distance_at_the_real_entry():
+    """The 2026-08-24 EUR_USD fill: intended 151.9 pips, actually got 103.0."""
+    sl, tp = reanchor_bracket("EUR_USD", 1, 1.16647, 1.17136, 1.156165, 1.186555)
+    assert round(1.16647 - sl, 6) == round(1.17136 - 1.156165, 6)   # stop distance preserved
+    assert round(tp - 1.16647, 6) == round(1.186555 - 1.17136, 6)   # target distance preserved
+    assert sl < 1.16647 < tp
+
+
+def test_reanchor_rescues_the_order_that_was_rejected_wrong_side():
+    """The 2026-08-26 GBP_USD reject: drift 73 pips vs a 64-pip stop."""
+    sl, tp = reanchor_bracket("GBP_USD", 1, 1.36051, 1.36778, 1.361345, 1.374215)
+    assert sl < 1.36051 < tp
+    assert round(1.36051 - sl, 6) == round(1.36778 - 1.361345, 6)
+
+
+def test_reanchor_reverses_geometry_for_a_short():
+    sl, tp = reanchor_bracket("GBP_USD", -1, 1.36051, 1.36778, 1.374215, 1.361345)
+    assert tp < 1.36051 < sl
+
+
+def test_reanchor_rejects_a_stale_setup_past_the_drift_limit():
+    with pytest.raises(StaleSetupError):
+        reanchor_bracket("GBP_USD", 1, 1.34000, 1.36778, 1.361345, 1.374215,
+                         drift_sl_mult=2.0)
+
+
+def test_reanchor_rejects_a_degenerate_bracket():
+    with pytest.raises(InvalidOrderError):
+        reanchor_bracket("EUR_USD", 1, 1.10, 1.10, 1.10, 1.10)
+
+
+def test_build_order_without_entry_anchor_keeps_verbatim_behaviour():
+    """Orders minted before this change carry no proposed_entry — do not reject them."""
+    pipe = ExecutionPipeline(shadow=True,
+                             clock=lambda: datetime(2026, 6, 24, 12, tzinfo=timezone.utc))
+    rc = RiskContext(atr=0.001, suggested_sl=1.0950, suggested_tp=1.1150)
+    order = dataclasses.replace(_orders()[0], risk_context=rc)
+    assert order.risk_context.proposed_entry is None
+    built = pipe.build_order(order, 1.10000)
+    assert built.stop_loss == 1.0950
+    assert built.take_profit == 1.1150
 
 
 # ----- mode gating ----------------------------------------------------------------
@@ -350,3 +410,124 @@ def test_execution_path_invokes_hooks():
     assert res["decision"] is Decision.EXECUTED
     assert events == {"submit": 1, "persist": 1, "emit": 1}
     assert isinstance(res["order"], ConstructedOrder)
+
+
+# ----- FX session boundaries (DST-aware) --------------------------------------------
+def test_session_tracks_dst_not_a_fixed_utc_hour():
+    """17:00 ET is 21:00 UTC in summer and 22:00 UTC in winter.
+
+    The old fixed pair (Sun 22:00 -> Fri 20:00 UTC) closed the book an hour early every
+    summer Friday and refused the first hour of every summer Sunday session.
+    """
+    from system2.execution.pipeline import is_in_session
+
+    # --- summer (EDT, close 21:00 UTC) ---
+    assert is_in_session(datetime(2026, 8, 28, 20, 59, tzinfo=timezone.utc))      # open
+    assert not is_in_session(datetime(2026, 8, 28, 21, 1, tzinfo=timezone.utc))   # closed
+    assert not is_in_session(datetime(2026, 8, 30, 20, 59, tzinfo=timezone.utc))  # pre-open
+    assert is_in_session(datetime(2026, 8, 30, 21, 1, tzinfo=timezone.utc))       # reopened
+
+    # --- winter (EST, close 22:00 UTC) ---
+    assert is_in_session(datetime(2026, 12, 4, 21, 59, tzinfo=timezone.utc))      # still open
+    assert not is_in_session(datetime(2026, 12, 4, 22, 1, tzinfo=timezone.utc))   # closed
+    assert not is_in_session(datetime(2026, 12, 6, 21, 59, tzinfo=timezone.utc))  # pre-open
+    assert is_in_session(datetime(2026, 12, 6, 22, 1, tzinfo=timezone.utc))       # reopened
+
+
+def test_session_closed_all_saturday_and_open_midweek():
+    from system2.execution.pipeline import is_in_session
+
+    for h in (0, 6, 12, 18, 23):
+        assert not is_in_session(datetime(2026, 8, 29, h, tzinfo=timezone.utc)), f"Sat {h}:00"
+    for d in (24, 25, 26, 27):   # Mon-Thu
+        for h in (0, 12, 23):
+            assert is_in_session(datetime(2026, 8, d, h, tzinfo=timezone.utc)), f"{d} {h}:00"
+
+
+def test_session_open_hours_match_the_real_fx_week():
+    """120 of 168 hours — the market is shut 48h, and we should be available for the other 120."""
+    from system2.execution.pipeline import is_in_session
+
+    start = datetime(2026, 8, 24, tzinfo=timezone.utc)  # Monday
+    assert sum(1 for i in range(168)
+               if is_in_session(start + timedelta(hours=i))) == 120
+
+
+# ----- drill: rehearse the whole path, stop before the broker -----------------------
+def _drill_order(**over) -> ApprovedOrder:
+    base = dict(
+        idempotency_key="k-drill-1", correlation_id="c-drill", instrument="EUR_USD",
+        side="BUY", units=1000, granularity="H1",
+        risk_context=RiskContext(atr=0.0010), drill=True,
+    )
+    base.update(over)
+    return ApprovedOrder(**base)
+
+
+def test_drill_is_never_submitted():
+    """The headline invariant: a drill must not reach the broker."""
+    submits = []
+    pipe = ExecutionPipeline(mode=ExecMode.EXECUTION_ONLY, shadow=False,
+                             clock=lambda: datetime(2026, 6, 24, 12, tzinfo=timezone.utc))
+    res = pipe.process(_drill_order(), 1.10000, submit_fn=lambda c: submits.append(c))
+    assert res["decision"] is Decision.DRILL_NOT_SUBMITTED
+    assert submits == [], "a drill reached the broker"
+    assert res["order"] is not None, "the constructed order should still be returned"
+    assert res["fill"] is None
+
+
+def test_drill_still_passes_through_every_gate():
+    """A drill that fails a real check must fail it, not sail through as a rehearsal."""
+    pipe = ExecutionPipeline(mode=ExecMode.EXECUTION_ONLY, shadow=False,
+                             clock=lambda: datetime(2026, 6, 24, 12, tzinfo=timezone.utc))
+    # no market price -> rejected at construction, NOT reported as a clean drill
+    res = pipe.process(_drill_order(), None, submit_fn=lambda c: None)
+    assert res["decision"] is Decision.REJECTED_INVALID
+
+    # last-line validation rejects -> that wins over the drill short-circuit
+    res = pipe.process(_drill_order(idempotency_key="k-drill-2"), 1.10000,
+                       submit_fn=lambda c: None,
+                       validate_fn=lambda c: (False, "notional over cap"))
+    assert res["decision"] is Decision.REJECTED_VALIDATION
+
+    # backup guard rejects -> also wins
+    guard = BackupCorrelationGuard(max_open_positions=1)
+    pipe2 = ExecutionPipeline(mode=ExecMode.EXECUTION_ONLY, shadow=False, backup_guard=guard,
+                              clock=lambda: datetime(2026, 6, 24, 12, tzinfo=timezone.utc))
+    res = pipe2.process(_drill_order(idempotency_key="k-drill-3"), 1.10000,
+                        submit_fn=lambda c: None, open_instruments=["GBP_USD"])
+    assert res["decision"] is Decision.REJECTED_BACKUP_GUARD
+
+
+def test_drill_does_not_consume_the_idempotency_key():
+    """A rehearsal must not burn the identity of the real order that may follow."""
+    submits = []
+    pipe = ExecutionPipeline(mode=ExecMode.EXECUTION_ONLY, shadow=False,
+                             clock=lambda: datetime(2026, 6, 24, 12, tzinfo=timezone.utc))
+    pipe.process(_drill_order(), 1.10000, submit_fn=lambda c: submits.append(c))
+    real = dataclasses.replace(_drill_order(), drill=False)
+    res = pipe.process(real, 1.10000, submit_fn=lambda c: submits.append(c))
+    assert res["decision"] is Decision.EXECUTED
+    assert len(submits) == 1, "the real order after a drill must still execute"
+
+
+def test_absent_drill_flag_means_real_order():
+    """Back-compat + fail-safe: no flag is a REAL order, never a silent rehearsal."""
+    submits = []
+    pipe = ExecutionPipeline(mode=ExecMode.EXECUTION_ONLY, shadow=False,
+                             clock=lambda: datetime(2026, 6, 24, 12, tzinfo=timezone.utc))
+    order = ApprovedOrder.from_dict({
+        "idempotency_key": "k-real", "correlation_id": "c-real", "instrument": "EUR_USD",
+        "side": "BUY", "units": 1000, "granularity": "H1", "risk_context": {"atr": 0.0010},
+    })
+    assert order.drill is False
+    res = pipe.process(order, 1.10000, submit_fn=lambda c: submits.append(c))
+    assert res["decision"] is Decision.EXECUTED and len(submits) == 1
+
+
+def test_drill_flag_survives_from_dict():
+    o = ApprovedOrder.from_dict({
+        "idempotency_key": "k", "correlation_id": "c", "instrument": "EUR_USD", "side": "BUY",
+        "units": 1000, "granularity": "H1", "risk_context": {"atr": 0.001}, "drill": True,
+    })
+    assert o.drill is True
