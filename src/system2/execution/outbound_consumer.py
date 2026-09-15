@@ -67,6 +67,12 @@ class SqliteProcessedStore:
             "CREATE TABLE IF NOT EXISTS processed("
             "idempotency_key TEXT PRIMARY KEY, processed_at TEXT NOT NULL)"
         )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS suppressed_duplicates("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "dedup_key TEXT NOT NULL, "
+            "suppressed_at TEXT NOT NULL)"
+        )
 
     def seen(self, key: str) -> bool:
         return (
@@ -82,6 +88,16 @@ class SqliteProcessedStore:
             (key, datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
         )
 
+    def record_suppression(self, key: str) -> None:
+        self._conn.execute(
+            "INSERT INTO suppressed_duplicates(dedup_key, suppressed_at) VALUES (?, ?)",
+            (key, datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")),
+        )
+
+    def suppressed_count(self) -> int:
+        row = self._conn.execute("SELECT count(*) FROM suppressed_duplicates").fetchone()
+        return int(row[0]) if row else 0
+
     def close(self) -> None:
         self._conn.close()
 
@@ -94,6 +110,7 @@ class ConsumerLag:
     last_message_at: datetime | None = None  # wall-clock receipt of the last message
     last_message_created_at: datetime | None = None  # producer ``created_at`` of last message
     messages_seen: int = 0
+    duplicates_suppressed: int = 0
 
     def seconds_since_last_message(self, now: datetime) -> float | None:
         if self.last_message_at is None:
@@ -240,8 +257,12 @@ class OutboundConsumer:
         # see ``pipeline.guard_keys``.
         for key in guard_keys(order):
             if self.pipeline.processed.seen(key):
-                log_event(log, logging.INFO, "already executed -> ack/skip",
-                          idempotency_key=order.idempotency_key, dedup_key=key)
+                self.lag.duplicates_suppressed += 1
+                if hasattr(self.pipeline.processed, "record_suppression"):
+                    self.pipeline.processed.record_suppression(key)
+                log_event(log, logging.INFO, "duplicate trade intent on signal_id suppressed",
+                          signal_id=order.signal_id, idempotency_key=order.idempotency_key,
+                          dedup_key=key, duplicates_suppressed=self.lag.duplicates_suppressed)
                 msg.ack()
                 return "duplicate"
 

@@ -275,3 +275,224 @@ def test_undated_heartbeat_is_refused(queue, tmp_path):
     assert stats.get("heartbeat_stale") == 1
     assert calls == []  # the monitor was never even asked
     assert queue.pull(SUB) == []  # still ack'd, never a poison loop
+
+# ----- Divergence Check ----------------------------------------------------
+def test_divergence_check_fires_when_signals_published_but_unseen():
+    """A test where signals_published_total increments while messages_seen does not raises the divergence condition; a test where both stay flat does not."""
+    from system2.telemetry.health import check_signal_divergence as d
+
+    B = "2026-08-31T00:00:00Z"   # same process across both observations
+
+    # Nothing published => nothing to expect.
+    assert d(0, 0, 0, 0, B, B) == "ok"
+    assert d(5, 5, 5, 5, B, B) == "ok"
+
+    # Published, and nothing arrived => a real gap.
+    assert d(1, 0, 0, 0, B, B) == "divergent"
+    assert d(6, 5, 5, 5, B, B) == "divergent"
+
+    # Published, and something arrived => healthy flow.
+    assert d(1, 0, 1, 0, B, B) == "ok"
+    assert d(2, 0, 1, 0, B, B) == "ok"   # S2 may lag; it is not flat
+
+    # S1's counter going backwards is not a divergence.
+    assert d(0, 1, 0, 0, B, B) == "ok"
+
+
+def test_divergence_does_not_false_alarm_across_a_restart():
+    """messages_seen resets to 0 on restart; S1's counter does not.
+
+    Differencing them across a process boundary compares a fresh counter against an
+    old one. The pre-fix implementation clamped the negative delta to zero with
+    max(0, ...), so a restart during which every message was consumed still reported
+    a gap. These are the exact cases that fired.
+    """
+    from system2.telemetry.health import check_signal_divergence as d
+
+    OLD, NEW = "2026-08-30T00:00:00Z", "2026-08-31T00:00:00Z"
+
+    # Restarted and consumed 3 -- previously "divergent", which was wrong.
+    assert d(6, 5, 3, 5, NEW, OLD) == "indeterminate"
+
+    # Restarted and consumed all 10 -- previously "divergent", most wrong of all.
+    assert d(15, 5, 10, 40, NEW, OLD) == "indeterminate"
+
+    # Restarted and genuinely saw nothing: still not assertable from these numbers.
+    assert d(6, 5, 0, 5, NEW, OLD) == "indeterminate"
+
+    # Same process, counter goes backwards anyway => untrustworthy, never "ok".
+    assert d(6, 5, 3, 5, NEW, NEW) == "indeterminate"
+
+    # And the restart must not mask a real gap once a baseline is re-established.
+    assert d(7, 6, 0, 0, NEW, NEW) == "divergent"
+
+
+def test_heartbeats_do_not_suppress_divergence_check(queue, tmp_path):
+    """A test drives the consumer with heartbeats only for a simulated hour and asserts the divergence check can still fire — i.e. heartbeats alone never mark the signal path healthy."""
+    from system2.telemetry.health import check_signal_divergence
+    consumer, _ = _consumer(queue, tmp_path)
+    consumer.heartbeat_fn = lambda at: True
+
+    # Drive consumer with heartbeats only for a simulated hour
+    for _ in range(60):
+        queue.publish(SUB, _heartbeat_msg())
+        consumer.poll_once()
+
+    # heartbeats do not inflate messages_seen
+    assert consumer.lag.messages_seen == 0
+
+    # Divergence check MUST STILL FIRE if signals were supposedly published
+    assert check_signal_divergence(
+        s1_published_total_now=10, 
+        s1_published_total_prev=0, 
+        messages_seen_now=consumer.lag.messages_seen, 
+        messages_seen_prev=0,
+        process_started_at_now="2026-08-31T00:00:00Z",
+        process_started_at_prev="2026-08-31T00:00:00Z",
+    ) == "divergent"
+
+
+# --------------------------------------------------------------------------- #
+# D5 acceptance tests — 2026-09-02 USD_JPY re-emission deduplication
+# --------------------------------------------------------------------------- #
+def test_d5_usd_jpy_reemission_trade_intent_dedupe(queue, tmp_path):
+    """Acceptance test D5:
+    Replaying both USD_JPY messages through the ingester produces ONE trade intent.
+    The retained intent carries entry 158.568 (the first), not 158.849.
+    The suppression is counted and logged, and that count is queryable.
+    """
+    from system2.telemetry.health import HealthReporter
+
+    submits: list = []
+    consumer, _ = _consumer(queue, tmp_path, submits=submits)
+    consumer.price_fn = lambda o: (o.risk_context.proposed_entry or 158.568)
+
+    reporter = HealthReporter(
+        messages_seen_fn=lambda: consumer.lag.messages_seen,
+        duplicates_suppressed_fn=lambda: consumer.lag.duplicates_suppressed,
+    )
+
+    signal_id = "4af8a6fe-d8f8-5eec-97af-b9e2c793338f"
+
+    # Emission 1 (2026-09-02T14:15:17Z): score_run_id=98953363..., entry 158.568
+    msg1 = _order_msg(
+        idempotency_key="ord-d5-first-98953363",
+        message_id="m-first",
+        signal_id=signal_id,
+        instrument="USD_JPY",
+        side="SELL",
+        units=-10000,
+        proposed_entry=158.568,
+        suggested_sl=160.1835,
+        suggested_tp=155.337,
+        created_at="2026-09-02T14:15:17Z",
+    )
+    # Ensure risk_context carries proposed_entry
+    msg1["risk_context"]["proposed_entry"] = 158.568
+
+    # Emission 2 (2026-09-02T17:15:27Z): score_run_id=964afac9..., entry 158.849
+    msg2 = _order_msg(
+        idempotency_key="ord-d5-second-964afac9",
+        message_id="m-second",
+        signal_id=signal_id,
+        instrument="USD_JPY",
+        side="SELL",
+        units=-10000,
+        proposed_entry=158.849,
+        suggested_sl=160.1835,
+        suggested_tp=155.337,
+        created_at="2026-09-02T17:15:27Z",
+    )
+    msg2["risk_context"]["proposed_entry"] = 158.849
+
+    # 1. Replay first message through ingester
+    queue.publish(SUB, msg1)
+    stats1 = consumer.poll_once()
+    assert stats1 == {"executed": 1}
+    assert len(submits) == 1
+    assert submits[0].entry_price == 158.568
+    assert consumer.lag.messages_seen == 1
+    assert consumer.lag.duplicates_suppressed == 0
+    assert reporter.status()["queue"]["duplicates_suppressed"] == 0
+
+    # 2. Replay second message (re-emission) through ingester
+    queue.publish(SUB, msg2)
+    stats2 = consumer.poll_once()
+    assert stats2 == {"duplicate": 1}
+
+    # Exactly ONE trade intent retained, carrying entry 158.568 (the first), not 158.849
+    assert len(submits) == 1
+    assert submits[0].entry_price == 158.568
+
+    # The suppression is counted and logged, and that count is queryable
+    assert consumer.lag.messages_seen == 2
+    assert consumer.lag.duplicates_suppressed == 1
+    assert consumer.pipeline.processed.suppressed_count() == 1
+    assert reporter.status()["queue"]["duplicates_suppressed"] == 1
+
+
+def test_d5_ledger_ingester_composite_key_stores_two_rows(tmp_path):
+    """Acceptance test D5 ledger semantics:
+    Replaying both through the ledger ingester produces TWO stored rows
+    because ledger rows are observations keyed on (signal_id, score_run_id).
+    """
+    import sqlite3
+
+    db_path = tmp_path / "ledger.db"
+    conn = sqlite3.connect(str(db_path))
+    # Schema matches s1_scored_signals_log PRIMARY KEY (signal_id, score_run_id)
+    conn.execute(
+        """CREATE TABLE s1_scored_signals_log (
+            signal_id TEXT NOT NULL,
+            score_run_id TEXT NOT NULL,
+            signal_time_utc TEXT NOT NULL,
+            logged_at TEXT NOT NULL,
+            pair TEXT NOT NULL,
+            proposed_entry REAL NOT NULL,
+            PRIMARY KEY (signal_id, score_run_id)
+        )"""
+    )
+
+    signal_id = "4af8a6fe-d8f8-5eec-97af-b9e2c793338f"
+    row1 = (signal_id, "98953363-52af-4197-b406-f2cb3adca509", "2026-09-02T13:00:00Z",
+            "2026-09-02T14:15:17Z", "USD_JPY", 158.568)
+    row2 = (signal_id, "964afac9-abaa-4e1c-9770-e0d20fb0b970", "2026-09-02T13:00:00Z",
+            "2026-09-02T17:15:27Z", "USD_JPY", 158.849)
+
+    for row in [row1, row2]:
+        conn.execute(
+            """INSERT INTO s1_scored_signals_log
+               (signal_id, score_run_id, signal_time_utc, logged_at, pair, proposed_entry)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (signal_id, score_run_id) DO NOTHING""",
+            row,
+        )
+
+    count = conn.execute("SELECT count(*) FROM s1_scored_signals_log").fetchone()[0]
+    assert count == 2
+
+    # Verify both observations are preserved with their respective entries
+    rows = conn.execute(
+        "SELECT score_run_id, proposed_entry FROM s1_scored_signals_log ORDER BY logged_at"
+    ).fetchall()
+    assert rows[0] == ("98953363-52af-4197-b406-f2cb3adca509", 158.568)
+    assert rows[1] == ("964afac9-abaa-4e1c-9770-e0d20fb0b970", 158.849)
+    conn.close()
+
+
+def test_d5_shadow_mode_dedupes_on_signal_id(queue, tmp_path):
+    """In shadow mode, a repeat signal_id is also a no-op duplicate."""
+    consumer, _ = _consumer(queue, tmp_path, shadow=True)
+    signal_id = "4af8a6fe-d8f8-5eec-97af-b9e2c793338f"
+
+    msg1 = _order_msg(idempotency_key="ord-1", signal_id=signal_id)
+    msg2 = _order_msg(idempotency_key="ord-2", signal_id=signal_id)
+
+    queue.publish(SUB, msg1)
+    assert consumer.poll_once() == {"shadow_constructed": 1}
+    assert consumer.lag.duplicates_suppressed == 0
+
+    queue.publish(SUB, msg2)
+    assert consumer.poll_once() == {"duplicate": 1}
+    assert consumer.lag.duplicates_suppressed == 1
+

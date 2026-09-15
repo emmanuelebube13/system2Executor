@@ -95,6 +95,7 @@ class RiskContext:
     atr: float
     suggested_sl: float | None = None
     suggested_tp: float | None = None
+    proposed_entry: float | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RiskContext":
@@ -102,6 +103,7 @@ class RiskContext:
             atr=float(d["atr"]),
             suggested_sl=(float(d["suggested_sl"]) if d.get("suggested_sl") is not None else None),
             suggested_tp=(float(d["suggested_tp"]) if d.get("suggested_tp") is not None else None),
+            proposed_entry=(float(d["proposed_entry"]) if d.get("proposed_entry") is not None else None),
         )
 
 
@@ -116,7 +118,7 @@ class ApprovedOrder:
     units: float  # signed, already sized by AMS
     granularity: str  # "H1" | "H4"
     risk_context: RiskContext
-    signal_id: int | None = None
+    signal_id: str | int | None = None
     strategy_id: int | None = None
     ams_decision_id: str | None = None
     created_at: str | None = None
@@ -349,6 +351,7 @@ class BackupCorrelationGuard:
 class InMemoryProcessedStore:
     def __init__(self) -> None:
         self._seen: set[str] = set()
+        self._suppressed_count: int = 0
 
     def seen(self, key: str) -> bool:
         return key in self._seen
@@ -356,19 +359,26 @@ class InMemoryProcessedStore:
     def mark(self, key: str) -> None:
         self._seen.add(key)
 
+    def record_suppression(self, key: str) -> None:
+        self._suppressed_count += 1
+
+    @property
+    def suppressed_count(self) -> int:
+        return self._suppressed_count
+
 
 def guard_keys(order: "ApprovedOrder") -> list[str]:
     """Every key an approved order must be deduped on, most specific first.
 
+    ``signal_id`` is the primary trade intent key (D5): one signal => at most one broker order /
+    trade intent. A repeat signal_id is a no-op, not an update.
     ``idempotency_key`` is the order identity (System 3's ``order_request_id``, relayed by the
-    bridge). ``signal_id`` is added as **defence in depth** (F-206/F-303): System 3 is supposed
-    to derive one stable order id per signal, but if it ever re-mints one, the order id stops
-    deduping while the signal still does — so a Guardian fault cannot double a live position
-    on System 2's watch. One approved signal ⇒ at most one broker order, by construction.
+    bridge).
     """
-    keys = [order.idempotency_key]
+    keys = []
     if order.signal_id is not None and str(order.signal_id) != "":
         keys.append(f"signal:{order.signal_id}")
+    keys.append(order.idempotency_key)
     return keys
 
 
@@ -391,6 +401,7 @@ class ExecutionPipeline:
         self.mode = mode or ExecMode((self.secrets.get("EXEC_MODE", "execution_only") or "execution_only"))
         self.shadow = resolve_shadow(self.secrets) if shadow is None else shadow
         self.processed = processed_store or InMemoryProcessedStore()
+        self.duplicates_suppressed: int = 0
         self.backup_guard = backup_guard or BackupCorrelationGuard(
             max_open_positions=self.secrets.get_int("MAX_OPEN_POSITIONS", 8)
         )
@@ -461,13 +472,17 @@ class ExecutionPipeline:
 
         for key in guard_keys(order):
             if self.processed.seen(key):
-                log_event(log, logging.INFO, "already executed; skipping",
-                          idempotency_key=order.idempotency_key, dedup_key=key)
+                self.duplicates_suppressed += 1
+                if hasattr(self.processed, "record_suppression"):
+                    self.processed.record_suppression(key)
+                log_event(log, logging.INFO, "duplicate trade intent on signal_id suppressed",
+                          signal_id=order.signal_id, idempotency_key=order.idempotency_key,
+                          dedup_key=key, duplicates_suppressed=self.duplicates_suppressed)
                 return {"decision": Decision.SKIPPED_DUPLICATE, "order": None, "fill": None}
 
         if not is_in_session(self._clock()):
             log_event(log, logging.WARNING, "order outside trading session; rejected",
-                      idempotency_key=order.idempotency_key, instrument=order.instrument)
+                       idempotency_key=order.idempotency_key, instrument=order.instrument)
             return {"decision": Decision.REJECTED_OUT_OF_SESSION, "order": None, "fill": None}
 
         try:
@@ -499,6 +514,8 @@ class ExecutionPipeline:
             return {"decision": Decision.REJECTED_BACKUP_GUARD, "order": constructed, "fill": None, "reason": reason}
 
         if self.shadow:
+            for key in guard_keys(order):
+                self.processed.mark(key)
             log_event(log, logging.INFO, "shadow mode: constructed order, NOT submitted",
                       idempotency_key=order.idempotency_key)
             return {"decision": Decision.SHADOW, "order": constructed, "fill": None}
