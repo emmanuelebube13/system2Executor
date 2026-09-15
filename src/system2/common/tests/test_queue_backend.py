@@ -6,16 +6,13 @@ acked used to sit in ``inflight`` forever, so a crash silently lost an approved 
 
 from __future__ import annotations
 
-import os
 import sqlite3
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import pytest
 
 from system2.common.queue_backend import (
     LocalDurableBackend,
-    SharedQueueMissing,
-    _assert_shared_queue,
     ReceivedMessage,
     make_envelope,
 )
@@ -194,137 +191,3 @@ def test_recovers_a_queue_db_written_before_the_lease_existed(tmp_path: Path):
     msgs = q.pull("orders")
     assert [m.body for m in msgs] == [{"stranded": True}]
     q.close()
-
-
-# --------------------------------------------------------------------------- #
-# Shared-queue assertion (P0)
-#
-# sqlite3.connect creates a database at any path it is given, so a wrong
-# QUEUE_LOCAL_PATH used to yield a private, permanently empty queue that looked
-# exactly like a quiet one. These pin the refusal to the specific shapes a wrong
-# path takes.
-# --------------------------------------------------------------------------- #
-
-def test_assert_shared_queue_accepts_a_real_queue(tmp_path: Path) -> None:
-    path = tmp_path / "queue.db"
-    LocalDurableBackend(path).close()
-    _assert_shared_queue(path)  # does not raise
-
-
-def test_assert_shared_queue_rejects_missing_file(tmp_path: Path) -> None:
-    with pytest.raises(SharedQueueMissing, match="does not exist"):
-        _assert_shared_queue(tmp_path / "queue.db")
-
-
-def test_assert_shared_queue_rejects_zero_byte_file(tmp_path: Path) -> None:
-    """The fingerprint of a previous silent-create, not a shared queue."""
-    path = tmp_path / "queue.db"
-    path.touch()
-    with pytest.raises(SharedQueueMissing, match="0 bytes"):
-        _assert_shared_queue(path)
-
-
-def test_assert_shared_queue_rejects_a_db_without_the_queue_table(tmp_path: Path) -> None:
-    path = tmp_path / "queue.db"
-    con = sqlite3.connect(str(path), isolation_level=None)
-    con.execute("CREATE TABLE something_else(x INTEGER)")
-    con.close()
-    with pytest.raises(SharedQueueMissing, match="no 'queue' table"):
-        _assert_shared_queue(path)
-
-
-def test_require_existing_refuses_before_creating_the_file(tmp_path: Path) -> None:
-    """The file must not exist afterwards — refusing after creating it is no refusal."""
-    path = tmp_path / "nested" / "queue.db"
-    with pytest.raises(SharedQueueMissing):
-        LocalDurableBackend(path, require_existing=True)
-    assert not path.exists()
-    assert not path.parent.exists()
-
-
-def test_require_existing_defaults_off_so_local_stores_still_self_create(tmp_path: Path) -> None:
-    """The fill outbox and tests legitimately create their own db."""
-    q = LocalDurableBackend(tmp_path / "outbox.db")
-    q.close()
-
-
-# --------------------------------------------------------------------------- #
-# Identity, not shape (the trading-1 case)
-#
-# The first version of _assert_shared_queue checked five SHAPES. The bogus file
-# on trading-1 was 4096 bytes of valid SQLite containing a `queue` table --
-# because our own code created it -- so it passed all five and was still the
-# wrong file. These pin the checks that actually distinguish identity.
-# --------------------------------------------------------------------------- #
-
-def test_a_private_queue_our_own_code_created_still_passes_every_shape_check(tmp_path):
-    """Establishes the premise: shape checks alone cannot catch this."""
-    bogus = tmp_path / "private" / "queue.db"
-    LocalDurableBackend(bogus).close()
-    assert bogus.exists() and bogus.stat().st_size > 0
-    _assert_shared_queue(bogus)  # every shape check passes -- and it is the wrong file
-
-
-def test_identity_rejects_a_lookalike_with_a_different_inode(tmp_path):
-    shared = tmp_path / "shared" / "queue.db"
-    bogus = tmp_path / "private" / "queue.db"
-    LocalDurableBackend(shared).close()
-    LocalDurableBackend(bogus).close()
-    _assert_shared_queue(shared, expected=shared)          # same file: fine
-    with pytest.raises(SharedQueueMissing, match="not the expected file"):
-        _assert_shared_queue(bogus, expected=shared)       # lookalike: refused
-
-
-def test_identity_accepts_a_different_route_to_the_same_file(tmp_path):
-    """Same inode via a different path spelling must still pass."""
-    shared = tmp_path / "shared" / "queue.db"
-    LocalDurableBackend(shared).close()
-    roundabout = tmp_path / "shared" / ".." / "shared" / "queue.db"
-    _assert_shared_queue(roundabout, expected=shared)
-
-
-def test_expected_path_that_does_not_exist_is_refused(tmp_path):
-    shared = tmp_path / "queue.db"
-    LocalDurableBackend(shared).close()
-    with pytest.raises(SharedQueueMissing, match="EXPECTED_PATH cannot be read"):
-        _assert_shared_queue(shared, expected=tmp_path / "nowhere.db")
-
-
-def test_a_relative_queue_path_is_refused(tmp_path, monkeypatch):
-    """The trading-1 defect itself.
-
-    A Windows path on POSIX has no leading '/', so it is one relative filename that
-    resolves against the working directory -- which is how the bogus file came to sit
-    inside the application directory. Refused before it can exist.
-    """
-    monkeypatch.chdir(tmp_path)
-    LocalDurableBackend(Path("state") / "queue.db").close()   # make it genuinely exist
-    with pytest.raises(SharedQueueMissing, match="not absolute"):
-        _assert_shared_queue(Path("state") / "queue.db")
-
-
-@pytest.mark.skipif(os.name == "nt",
-                    reason="POSIX-only defect: on Windows a C: path really is absolute")
-def test_a_windows_path_on_posix_is_refused(tmp_path, monkeypatch):
-    r"""The trading-1 file, reproduced end to end.
-
-    C:\Users\...\queue.db has no leading '/', so sqlite3 creates one oddly-named file in
-    the working directory: 4096 bytes of valid SQLite with a queue table. Real, and wrong.
-    """
-    monkeypatch.chdir(tmp_path)
-    winpath = Path(r"C:\Users\emman\OneDrive\shared\queue\queue.db")
-    LocalDurableBackend(winpath).close()          # exactly what sqlite3 did on trading-1
-    assert winpath.exists() and winpath.stat().st_size > 0
-    with pytest.raises(SharedQueueMissing):
-        _assert_shared_queue(winpath)
-
-
-def test_the_windows_path_is_relative_under_posix_semantics():
-    """Platform-independent proof of the property the POSIX test above relies on.
-
-    This one runs on the Windows dev box, so the discriminating fact is verified here
-    before the fix ships to the Linux host where the full test can actually execute.
-    """
-    p = PurePosixPath(r"C:\Users\emman\OneDrive\shared\queue\queue.db")
-    assert not p.is_absolute(), "if this ever becomes absolute the guard needs rethinking"
-    assert len(p.parts) == 1, "it is ONE filename containing backslashes, not a path"

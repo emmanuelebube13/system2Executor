@@ -441,9 +441,12 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
         safety_state_fn=lambda: monitor.state.value,
         model_set_id_fn=_active_model_set_id,
         staleness_fn=lambda: monitor.staleness_seconds(monitor.clock(), consumer.lag.last_message_at),
+        message_staleness_fn=lambda: consumer.lag.seconds_since_last_message(monitor.clock()),
+        heartbeat_staleness_fn=lambda: monitor.staleness_seconds(monitor.clock(), consumer.lag.last_message_at),
         staleness_limit_fn=lambda: monitor.config.staleness_limit_sec,
         last_message_at_fn=lambda: consumer.lag.last_message_at,
         messages_seen_fn=lambda: consumer.lag.messages_seen,
+        duplicates_suppressed_fn=lambda: consumer.lag.duplicates_suppressed,
         open_positions_fn=lambda: [{"trade_id": t.broker_trade_id, "instrument": t.instrument}
                                    for t in position_manager.trades.values() if not t.closed],
         outbox_depth_fn=lambda: outbox.depth("fill_outbox"),

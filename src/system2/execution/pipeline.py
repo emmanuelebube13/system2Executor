@@ -23,7 +23,8 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from enum import Enum
 from typing import Any, Callable, Iterable
 
@@ -80,6 +81,10 @@ class Decision(str, Enum):
     EXECUTED = "executed"
     SHADOW = "shadow_constructed"
     SKIPPED_DUPLICATE = "skipped_duplicate"
+    # A rehearsal that reached the last step and deliberately stopped. Distinct from SHADOW
+    # (an engine-wide posture) because this is one order opting out, and distinct from every
+    # REJECTED_* because nothing was wrong with it — it passed every gate.
+    DRILL_NOT_SUBMITTED = "drill_not_submitted"
     REJECTED_BACKUP_GUARD = "rejected_backup_guard"
     REJECTED_OUT_OF_SESSION = "rejected_out_of_session"
     REJECTED_INVALID = "rejected_invalid"
@@ -95,6 +100,12 @@ class RiskContext:
     atr: float
     suggested_sl: float | None = None
     suggested_tp: float | None = None
+    # The entry System 1 designed the bracket around. ``suggested_sl``/``suggested_tp`` are
+    # ABSOLUTE prices anchored to THIS entry, not to the price System 2 actually fills at, so
+    # without it the bracket cannot be re-anchored and its distances are meaningless. Optional
+    # because System 3 and the bridge only started forwarding it in this change — an order
+    # that predates that keeps the old verbatim behaviour rather than being rejected.
+    proposed_entry: float | None = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RiskContext":
@@ -102,6 +113,9 @@ class RiskContext:
             atr=float(d["atr"]),
             suggested_sl=(float(d["suggested_sl"]) if d.get("suggested_sl") is not None else None),
             suggested_tp=(float(d["suggested_tp"]) if d.get("suggested_tp") is not None else None),
+            proposed_entry=(
+                float(d["proposed_entry"]) if d.get("proposed_entry") is not None else None
+            ),
         )
 
 
@@ -116,12 +130,18 @@ class ApprovedOrder:
     units: float  # signed, already sized by AMS
     granularity: str  # "H1" | "H4"
     risk_context: RiskContext
-    signal_id: int | None = None
+    signal_id: str | int | None = None
     strategy_id: int | None = None
     ams_decision_id: str | None = None
     created_at: str | None = None
     schema_version: str = "1"
     message_id: str | None = None
+    # A rehearsal: construct and check this order exactly like a real one, then STOP before the
+    # broker. Defaults False so an order that predates the field — or one from a producer that
+    # never sets it — behaves exactly as it does today. Absent is NOT ambiguous here precisely
+    # because System 1 stamps it on every message; if that ever changes, the safe reading of a
+    # missing flag is "real order", which is what this default gives.
+    drill: bool = False
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ApprovedOrder":
@@ -139,6 +159,7 @@ class ApprovedOrder:
             created_at=d.get("created_at"),
             schema_version=str(d.get("schema_version", "1")),
             message_id=d.get("message_id"),
+            drill=bool(d.get("drill", False)),
         )
 
     @property
@@ -264,6 +285,64 @@ def assert_protective_prices(
     return stop_loss, take_profit
 
 
+class StaleSetupError(InvalidOrderError):
+    """The market has moved so far from the signal's entry that the setup no longer exists."""
+
+
+# How far the market may drift from ``proposed_entry`` before the setup is considered gone,
+# expressed as a multiple of the signal's own stop distance. Re-anchoring keeps the trade's
+# geometry intact but it cannot make a stale premise fresh: past this the entry level the
+# strategy was reasoning about is simply not where price is any more.
+DEFAULT_ENTRY_DRIFT_SL_MULT = 2.0
+
+
+def reanchor_bracket(
+    instrument: str,
+    direction: int,
+    price: float,
+    proposed_entry: float,
+    suggested_sl: float,
+    suggested_tp: float,
+    *,
+    drift_sl_mult: float = DEFAULT_ENTRY_DRIFT_SL_MULT,
+) -> tuple[float, float]:
+    """Re-express System 1's bracket around the entry System 2 is actually filling at.
+
+    ``suggested_sl``/``suggested_tp`` are absolute prices anchored to ``proposed_entry`` — a
+    *setup level*, not a spot quote (the same 1.36778 was proposed for GBP_USD on both 08-24
+    and 08-26). System 2 fills at market, and taking those absolute levels verbatim against a
+    different entry silently changes the trade:
+
+      * observed 2026-08-24, both fills: intended stop 151.9 / 163.1 pips, actual stop
+        103.0 / 112.8 pips — ~32% tighter than the distance System 3 sized the position on
+        (``sizing.py``: "the true risk-per-unit is |proposed_entry - proposed_sl|");
+      * observed 2026-08-26, GBP_USD: drift 73 pips exceeded the 64-pip stop, so the stop
+        landed on the far side of entry and ``assert_protective_prices`` rejected the order.
+
+    Preserving the *distances* rather than the *levels* fixes both: the stop stays the width
+    System 3 sized against, and a wrong-side bracket becomes arithmetically impossible.
+    """
+    sl_distance = abs(proposed_entry - suggested_sl)
+    tp_distance = abs(suggested_tp - proposed_entry)
+    if sl_distance <= 0 or tp_distance <= 0:
+        raise InvalidOrderError(
+            f"{instrument}: degenerate bracket from System 3 — entry={proposed_entry} "
+            f"SL={suggested_sl} TP={suggested_tp}; refusing to construct an order"
+        )
+
+    drift = abs(price - proposed_entry)
+    if drift > drift_sl_mult * sl_distance:
+        raise StaleSetupError(
+            f"{instrument}: entry drifted {drift:.5f} from proposed {proposed_entry} "
+            f"(> {drift_sl_mult}x the {sl_distance:.5f} stop distance); setup is stale, "
+            "refusing to construct an order"
+        )
+
+    if direction == 1:
+        return price - sl_distance, price + tp_distance
+    return price + sl_distance, price - tp_distance
+
+
 # --------------------------------------------------------------------------- #
 # ATR stop/target math — single source of truth (preserved contract)
 # --------------------------------------------------------------------------- #
@@ -307,17 +386,39 @@ def legacy_atr_risk_parameters(
     return entry_price + sl_distance, entry_price - tp_distance
 
 
-def is_in_session(dt: datetime) -> bool:
-    """Trading session guard: Sun 22:00 UTC -> Fri 20:00 UTC (weekend gap rejected)."""
+FX_TZ = "America/New_York"
+FX_SESSION_LOCAL_HOUR = 17          # the FX week: Sun 17:00 ET -> Fri 17:00 ET
+
+
+def _fx_session_edge(now: datetime, weekday: int, tz_name: str, local_hour: int) -> datetime:
+    """``weekday`` (Mon=0) at ``local_hour`` in ``tz_name``, as UTC, within ``now``'s week."""
+    local_now = now.astimezone(ZoneInfo(tz_name))
+    day = (local_now + timedelta(days=weekday - local_now.weekday())).date()
+    return datetime(day.year, day.month, day.day, local_hour,
+                    tzinfo=ZoneInfo(tz_name)).astimezone(timezone.utc)
+
+
+def is_in_session(dt: datetime, tz_name: str = FX_TZ,
+                  local_hour: int = FX_SESSION_LOCAL_HOUR) -> bool:
+    """Trading session guard: the real FX week, Sun 17:00 ET -> Fri 17:00 ET.
+
+    Was hardcoded as Sun 22:00 -> Fri 20:00 UTC. Two problems with fixed UTC hours:
+
+      * They are only right for half the year. 17:00 ET is 21:00 UTC under EDT and 22:00 UTC
+        under EST, so a fixed pair is an hour out for roughly five months at a time.
+      * They did not agree with System 3's layer I (Fri 18:00 -> Sun 22:00) or with each other,
+        so three different components each held a different opinion about when the market was
+        open, and the tightest one silently won.
+
+    Resolving through the exchange's timezone makes the boundary track the actual session and
+    gives both systems one definition to share.
+    """
     dt = dt.astimezone(timezone.utc)
-    wd = dt.weekday()  # Mon=0 .. Sun=6
-    if wd == 5:  # Saturday — always closed
-        return False
-    if wd == 6:  # Sunday — open from 22:00
-        return dt.hour >= 22
-    if wd == 4:  # Friday — closed from 20:00
-        return dt.hour < 20
-    return True  # Mon-Thu fully open
+    close = _fx_session_edge(dt, 4, tz_name, local_hour)   # Friday close
+    open_ = _fx_session_edge(dt, 6, tz_name, local_hour)   # Sunday open
+    if open_ < close:
+        open_ += timedelta(days=7)
+    return not (close <= dt < open_)
 
 
 # --------------------------------------------------------------------------- #
@@ -327,9 +428,20 @@ def is_in_session(dt: datetime) -> bool:
 class BackupCorrelationGuard:
     """Conservative hard backstop. Catches a System-3 fault; never re-decides risk.
 
-    Rejects only past *loose* hard limits set well above normal AMS sizing:
-      * total open positions >= ``max_open_positions``;
-      * a second open position in the same instrument (duplicate stacking).
+    Rejects only past one *loose* hard limit set well above normal AMS sizing:
+      * total open positions >= ``max_open_positions``.
+
+    **Same-instrument re-entry is NOT blocked here.** It used to be: a second position in
+    an instrument already held was rejected outright. That is a per-pair exposure decision,
+    and per-pair exposure belongs to System 3 — this guard's own contract is "catches a
+    System-3 fault; never re-decides risk". In practice the block was load-bearing in the
+    wrong direction: three positions opened 2026-08-24 never closed, and because EUR_USD,
+    GBP_USD and USD_CAD carry nearly all of the signal flow, every subsequent approved order
+    on those pairs was refused here for four days while System 3 had approved each one.
+
+    The overall ``max_open_positions`` ceiling still bounds total exposure, so a runaway
+    System 3 cannot open unbounded positions. Note that System 3 currently enforces no
+    per-pair stacking limit of its own; if one is wanted, that is where it belongs.
     """
 
     max_open_positions: int = 8
@@ -338,8 +450,6 @@ class BackupCorrelationGuard:
         open_list = list(open_instruments)
         if len(open_list) >= self.max_open_positions:
             return False, f"backup_guard: open positions {len(open_list)} >= cap {self.max_open_positions}"
-        if order.instrument in open_list:
-            return False, f"backup_guard: already an open position in {order.instrument}"
         return True, ""
 
 
@@ -349,12 +459,20 @@ class BackupCorrelationGuard:
 class InMemoryProcessedStore:
     def __init__(self) -> None:
         self._seen: set[str] = set()
+        self._suppressed_count: int = 0
 
     def seen(self, key: str) -> bool:
         return key in self._seen
 
     def mark(self, key: str) -> None:
         self._seen.add(key)
+
+    def record_suppression(self, key: str) -> None:
+        self._suppressed_count += 1
+
+    @property
+    def suppressed_count(self) -> int:
+        return self._suppressed_count
 
 
 def guard_keys(order: "ApprovedOrder") -> list[str]:
@@ -366,9 +484,10 @@ def guard_keys(order: "ApprovedOrder") -> list[str]:
     deduping while the signal still does — so a Guardian fault cannot double a live position
     on System 2's watch. One approved signal ⇒ at most one broker order, by construction.
     """
-    keys = [order.idempotency_key]
+    keys = []
     if order.signal_id is not None and str(order.signal_id) != "":
         keys.append(f"signal:{order.signal_id}")
+    keys.append(order.idempotency_key)
     return keys
 
 
@@ -391,8 +510,12 @@ class ExecutionPipeline:
         self.mode = mode or ExecMode((self.secrets.get("EXEC_MODE", "execution_only") or "execution_only"))
         self.shadow = resolve_shadow(self.secrets) if shadow is None else shadow
         self.processed = processed_store or InMemoryProcessedStore()
+        self.duplicates_suppressed: int = 0
         self.backup_guard = backup_guard or BackupCorrelationGuard(
             max_open_positions=self.secrets.get_int("MAX_OPEN_POSITIONS", 8)
+        )
+        self.entry_drift_sl_mult = float(
+            self.secrets.get_int("ENTRY_DRIFT_MAX_SL_MULT", int(DEFAULT_ENTRY_DRIFT_SL_MULT))
         )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -410,7 +533,17 @@ class ExecutionPipeline:
         rc = order.risk_context
         price = require_market_price(order.instrument, entry_price)
         if rc.suggested_sl is not None and rc.suggested_tp is not None:
-            stop_loss, take_profit = rc.suggested_sl, rc.suggested_tp
+            if rc.proposed_entry is not None:
+                # Preserve the bracket's GEOMETRY at the entry actually used, and refuse
+                # outright once the market has left the setup behind — see reanchor_bracket.
+                stop_loss, take_profit = reanchor_bracket(
+                    order.instrument, order.direction, price,
+                    rc.proposed_entry, rc.suggested_sl, rc.suggested_tp,
+                    drift_sl_mult=self.entry_drift_sl_mult,
+                )
+            else:
+                # Pre-change order with no entry anchor: unchanged verbatim behaviour.
+                stop_loss, take_profit = rc.suggested_sl, rc.suggested_tp
         else:
             stop_loss, take_profit = _atr_stops(order.direction, price, rc.atr)
         stop_loss, take_profit = assert_protective_prices(
@@ -461,8 +594,12 @@ class ExecutionPipeline:
 
         for key in guard_keys(order):
             if self.processed.seen(key):
-                log_event(log, logging.INFO, "already executed; skipping",
-                          idempotency_key=order.idempotency_key, dedup_key=key)
+                self.duplicates_suppressed += 1
+                if hasattr(self.processed, "record_suppression"):
+                    self.processed.record_suppression(key)
+                log_event(log, logging.INFO, "duplicate trade intent on signal_id suppressed",
+                          signal_id=order.signal_id, idempotency_key=order.idempotency_key,
+                          dedup_key=key, duplicates_suppressed=self.duplicates_suppressed)
                 return {"decision": Decision.SKIPPED_DUPLICATE, "order": None, "fill": None}
 
         if not is_in_session(self._clock()):
@@ -498,7 +635,25 @@ class ExecutionPipeline:
                       idempotency_key=order.idempotency_key, reason=reason)
             return {"decision": Decision.REJECTED_BACKUP_GUARD, "order": constructed, "fill": None, "reason": reason}
 
+        # A drill stops HERE — after construction, §7.2 validation and the backup guard, and
+        # immediately before the only irreversible step. Placing it last is the whole point:
+        # the rehearsal exercises every check a real order faces, so a drill that reaches this
+        # line has proven the path rather than bypassed it.
+        #
+        # It deliberately does NOT mark the idempotency key: a drill is a test, and testing one
+        # must not consume the identity of a real order that could legitimately follow.
+        if order.drill:
+            log_event(log, logging.INFO,
+                      "DRILL: order constructed and fully validated, NOT submitted to broker",
+                      idempotency_key=order.idempotency_key, instrument=constructed.instrument,
+                      side=constructed.side, units=constructed.units,
+                      entry_price=constructed.entry_price, sl=constructed.stop_loss,
+                      tp=constructed.take_profit, correlation_id=order.correlation_id)
+            return {"decision": Decision.DRILL_NOT_SUBMITTED, "order": constructed, "fill": None}
+
         if self.shadow:
+            for key in guard_keys(order):
+                self.processed.mark(key)
             log_event(log, logging.INFO, "shadow mode: constructed order, NOT submitted",
                       idempotency_key=order.idempotency_key)
             return {"decision": Decision.SHADOW, "order": constructed, "fill": None}

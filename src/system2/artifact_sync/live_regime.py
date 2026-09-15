@@ -14,7 +14,6 @@ serialized bundle, never re-derived here.
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -146,25 +145,11 @@ class LiveRegimeDetector:
         except OSError:
             return None
 
-    def _withdrawal(self) -> dict[str, Any] | None:
-        """The downloader's recorded withdrawal, or None (F-107).
-
-        Unreadable/absent state is NOT treated as a withdrawal: this runs on every load and a
-        transient read error must not halt regime inference. The downloader is the component
-        that fails closed on the pointer; this is the consumer honouring what it recorded.
-        """
-        try:
-            state = json.loads((self.root / "state.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        return state if state.get("withdrawn") is True else None
-
     def _on_disk_set_id(self) -> str | None:
         """The model set ``active`` points at right now, or None if there is no active link.
 
         Read on every load so a swap is noticed. Falls back to ``last_good`` only when
-        ``active`` is absent, mirroring the source walk below — otherwise a detector serving
-        from ``last_good`` would compare against ``active`` and reload on every single call.
+        ``active`` is absent, mirroring the source walk below.
         """
         for link in (self.root / "active", self.root / "last_good"):
             if link.exists():
@@ -201,23 +186,6 @@ class LiveRegimeDetector:
             log_event(log, logging.INFO, "model set changed on disk; reloading regime bundle",
                       loaded=self._bundle_set_id, on_disk=on_disk)
         self._seen_set_id = on_disk
-
-        # F-107: refuse a withdrawn model set. This check MUST come before the
-        # active -> last_good walk below, not instead of it: `last_good` points at whatever
-        # was active before the last swap, which for a withdrawal is the withdrawn set
-        # itself. Skipping `active` would silently reload the same bundle from `last_good`
-        # and report only "using last_good".
-        wd = self._withdrawal()
-        if wd is not None:
-            self._bundle = None
-            self._bundle_source = None
-            log_event(log, logging.CRITICAL,
-                      "model set is WITHDRAWN — refusing to load any regime bundle",
-                      withdrawn_at=wd.get("withdrawn_at"),
-                      model_set_id=wd.get("withdrawn_model_set_id"),
-                      detail=wd.get("withdrawn_reason"))
-            return False
-
         for source, link in (("active", self.root / "active"), ("last_good", self.root / "last_good")):
             path = self._find_artifact(link)
             if path is None:
@@ -286,8 +254,8 @@ class LiveRegimeDetector:
         The bundle carries the same weights twice: top-level ``feature_weights`` keyed by
         feature name, and per-granularity ``weights`` as a bare positional list. They agree
         today. Two copies that agree until they don't is precisely the shape of the
-        ``atr_pct_14`` incident, so prefer the named one — it cannot silently transpose if
-        ``feature_names`` is reordered — and refuse when the two disagree rather than
+        ``atr_pct_14`` incident, so prefer the named one -- it cannot silently transpose if
+        ``feature_names`` is reordered -- and refuse when the two disagree rather than
         picking one and hoping.
         """
         b = self._bundle

@@ -40,9 +40,12 @@ class HealthReporter:
 
     safety_state_fn: Callable[[], str] | None = None
     staleness_fn: Callable[[], float | None] | None = None
+    message_staleness_fn: Callable[[], float | None] | None = None
+    heartbeat_staleness_fn: Callable[[], float | None] | None = None
     staleness_limit_fn: Callable[[], float | None] | None = None
     last_message_at_fn: Callable[[], datetime | None] | None = None
     messages_seen_fn: Callable[[], int] | None = None
+    duplicates_suppressed_fn: Callable[[], int | None] | None = None
     open_positions_fn: Callable[[], list[dict[str, Any]]] | None = None
     outbox_depth_fn: Callable[[], int] | None = None
     model_set_id_fn: Callable[[], str | None] | None = None
@@ -144,11 +147,15 @@ class HealthReporter:
             "exec_shadow": self._exec_shadow(),
             "queue": {
                 "staleness_sec": self._safe(self.staleness_fn),
+                "heartbeat_staleness_sec": self._safe(self.heartbeat_staleness_fn),
+                "message_staleness_sec": self._safe(self.message_staleness_fn),
                 # The EFFECTIVE limit this process is running with. Exposed so the deployed
                 # safety posture can be audited without shell access to the box (F-304).
                 "staleness_limit_sec": self._safe(self.staleness_limit_fn),
                 "last_message_at": _utc_iso(self._safe(self.last_message_at_fn)),
                 "messages_seen": self._safe(self.messages_seen_fn, 0),
+                "duplicates_suppressed": self._safe(self.duplicates_suppressed_fn, 0),
+                "process_started_at": _utc_iso(self._started_at),
             },
             "outbox_depth": self._safe(self.outbox_depth_fn, 0),
             "open_positions": self._safe(self.open_positions_fn, []) or [],
@@ -206,3 +213,53 @@ class HealthReporter:
             "grid": self._safe(self.regime_grid_fn, []) or [],
             "as_of": _utc_iso(self.clock()),
         }
+
+def check_signal_divergence(
+    s1_published_total_now: int,
+    s1_published_total_prev: int,
+    messages_seen_now: int,
+    messages_seen_prev: int,
+    process_started_at_now: str | None = None,
+    process_started_at_prev: str | None = None,
+) -> str:
+    """Did System 1 publish signals that System 2 never saw?
+
+    Returns one of:
+      ``"divergent"``     -- S1 published, S2 saw nothing. A real gap.
+      ``"ok"``            -- either nothing was published, or what was published arrived.
+      ``"indeterminate"`` -- the two observations cannot be compared.
+
+    Silence is only a fault when something was supposed to arrive, so this
+    cross-references System 1's published counter. Both numbers already reach the
+    same bucket, so no new transport is needed.
+
+    THE RESTART TRAP, and why this returns three states rather than a bool.
+    ``messages_seen`` lives on an in-memory ``ConsumerLag`` and resets to 0 on every
+    process start, while S1's ``signals_published_total`` is cumulative and persists.
+    Differencing them naively across a restart is not a comparison of like with like:
+
+        prev s1=5  now=6   |  prev s2=40  now=10   (S2 restarted, consumed all 10)
+        s2_delta = max(0, 10 - 40) = 0             -> reads as "saw nothing"
+
+    That fires an alarm at the exact moment flow is healthy. Clamping the delta at
+    zero hides the restart instead of revealing it. When the process boundary moved,
+    the honest answer is that we cannot tell -- and "cannot tell" must not be folded
+    into "fine", which is the same rule the rest of this system follows for absent
+    values. Persisting ``messages_seen`` across restarts would remove the ambiguity
+    and is the better long-term fix; until then, say so rather than guess.
+    """
+    if process_started_at_now != process_started_at_prev:
+        # The process restarted between observations: messages_seen_prev belongs to a
+        # counter that no longer exists. Re-baseline on the next observation.
+        return "indeterminate"
+
+    if messages_seen_now < messages_seen_prev:
+        # Counter went backwards without the start time changing -- it cannot be
+        # trusted either way. Never silently clamp this to zero.
+        return "indeterminate"
+
+    s1_delta = s1_published_total_now - s1_published_total_prev
+    if s1_delta <= 0:
+        return "ok"
+
+    return "divergent" if (messages_seen_now - messages_seen_prev) == 0 else "ok"

@@ -120,28 +120,27 @@ class SharedQueueMissing(RuntimeError):
 
 
 def _assert_shared_queue(path: Path, expected: Path | str | None = None) -> None:
-    """Refuse to open ``path`` unless it is the shared queue.db — by identity, not shape.
+    """Refuse to open ``path`` unless it is the shared queue.db -- by identity, not shape.
 
-    Shape checks alone are not sufficient, and assuming they were is how the first version
-    of this function would have blessed the exact file it was written to reject. On
-    ``trading-1`` the bogus queue was 4,096 bytes of valid SQLite *containing a ``queue``
-    table* — because our own code created it. It exists, it is non-empty, it is SQLite, it
-    has the table. Every shape check passes and it is still the wrong file.
+    Shape checks alone are not sufficient. The bogus file on this host was 4,096 bytes of
+    valid SQLite *containing a ``queue`` table*, because our own code created it. It exists,
+    it is non-empty, it is SQLite, it has the table -- every shape check passes and it is
+    still the wrong file.
 
     So the structural checks come first and are cheap, but the load-bearing ones are:
 
-    * **absolute** — the real defect. ``C:\\Users\\...\\queue.db`` on Linux has no leading
+    * **absolute** -- the real defect. ``C:\\Users\\...\\queue.db`` on Linux has no leading
       ``/``, so it is not a path at all but a single *relative* filename containing
       backslashes, resolved against the process's working directory. That is why the bogus
       file appeared inside the application directory. A shared queue path is never relative.
-    * **no backslashes on POSIX** — a filename with backslashes is a Windows path that lost
+    * **no backslashes on POSIX** -- a filename with backslashes is a Windows path that lost
       its platform, never an intentional name.
-    * **same inode as ``expected``** — identity, when an expectation is configured
+    * **same inode as ``expected``** -- identity, when an expectation is configured
       (``QUEUE_LOCAL_EXPECTED_PATH``). ``st_dev``/``st_ino`` is the only check that answers
       "is this the same file System 3 has open?" rather than "does this look like a queue?".
 
     Bootstrapping a genuinely new deployment is still possible, but only deliberately:
-    set ``QUEUE_LOCAL_ALLOW_CREATE=true``. Never set it to make this error go away —
+    set ``QUEUE_LOCAL_ALLOW_CREATE=true``. Never set it to make this error go away --
     the error means the path is wrong, and creating the file hides that.
     """
     raw = str(path)
@@ -149,7 +148,7 @@ def _assert_shared_queue(path: Path, expected: Path | str | None = None) -> None
         raise SharedQueueMissing(
             f"QUEUE_LOCAL_PATH is not absolute: {raw!r}. It would resolve against the "
             f"working directory ({Path.cwd()}) and create a private queue there. A Windows "
-            "path on a POSIX host looks exactly like this — it is one relative filename, "
+            "path on a POSIX host looks exactly like this -- it is one relative filename, "
             "not a path."
         )
     if os.sep == "/" and "\\" in raw:
@@ -166,7 +165,7 @@ def _assert_shared_queue(path: Path, expected: Path | str | None = None) -> None
     if not resolved.exists():
         raise SharedQueueMissing(
             f"shared queue.db does not exist: {hint}. System 2 does not create the shared "
-            "queue — point QUEUE_LOCAL_PATH at the file System 3 and the bridge use, or set "
+            "queue -- point QUEUE_LOCAL_PATH at the file System 3 and the bridge use, or set "
             "QUEUE_LOCAL_ALLOW_CREATE=true if this really is a new deployment."
         )
     if not resolved.is_file():
@@ -207,7 +206,7 @@ def _assert_shared_queue(path: Path, expected: Path | str | None = None) -> None
             raise SharedQueueMissing(
                 f"queue is not the expected file. {hint}; expected {exp.resolve()} "
                 f"(dev/inode {exp_st.st_dev}/{exp_st.st_ino}, got {got_st.st_dev}/{got_st.st_ino}). "
-                "Same name is not same file — this is the check that catches a private "
+                "Same name is not same file -- this is the check that catches a private "
                 "queue that merely looks correct."
             )
 
@@ -246,11 +245,9 @@ class LocalDurableBackend:
                 available_at REAL NOT NULL DEFAULT 0,
                 ack_id TEXT,
                 leased_until REAL NOT NULL DEFAULT 0,
-                lease_owner TEXT,
-                done_at REAL)"""
+                lease_owner TEXT)"""
         )
         self._add_lease_columns()
-        self._add_done_at_column()
 
     def _add_lease_columns(self) -> None:
         """Add the lease columns to a queue.db created before F-307 was fixed.
@@ -267,15 +264,6 @@ class LocalDurableBackend:
             try:
                 self._conn.execute(f"ALTER TABLE queue ADD COLUMN {name} {decl}")
             except sqlite3.OperationalError:  # a peer process added it between the two calls
-                pass
-
-    def _add_done_at_column(self) -> None:
-        """Add the done_at column for retention policy."""
-        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(queue)")}
-        if "done_at" not in cols:
-            try:
-                self._conn.execute("ALTER TABLE queue ADD COLUMN done_at REAL")
-            except sqlite3.OperationalError:
                 pass
 
     def publish(self, topic: str, body: dict[str, Any]) -> None:
@@ -492,7 +480,7 @@ def build_queue(secrets: Any | None = None) -> QueueBackend:
     if provider == "local":
         path = secrets.get("QUEUE_LOCAL_PATH", "state/queue/queue.db")
         # P0: this is THE shared queue.db (System 2 + System 3 + the bridge). Fail loudly
-        # rather than silently create a private empty one — see _assert_shared_queue.
+        # rather than silently create a private empty one -- see _assert_shared_queue.
         # Only the factory asserts: LocalDurableBackend is also used for genuinely local,
         # self-created stores (the fill outbox) and by tests with tmp_path.
         return LocalDurableBackend(
