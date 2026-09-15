@@ -259,7 +259,7 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
     )
     from system2.execution.fill_producer import FillProducer, build_outbox
     from system2.execution.outbound_consumer import OutboundConsumer, SqliteProcessedStore
-    from system2.execution.pipeline import ExecMode, ExecutionPipeline, resolve_shadow
+    from system2.execution.pipeline import ExecMode, ExecutionPipeline, is_in_session, resolve_shadow
     from system2.execution.safety_mode import SafetyConfig, SafetyMonitor
     from system2.execution.validation import OrderValidator
     from system2.telemetry.health import HealthReporter
@@ -456,6 +456,11 @@ def build_from_secrets(secrets: Any | None = None) -> ExecutionRuntime:
         # this process actually resolved and is running with, not what the config file
         # says it should have resolved (F-309).
         shadow_fn=lambda: consumer.pipeline.shadow,
+        # Market session state for the dashboard's "market" tile. Deliberately the SAME
+        # is_in_session the validator and outbound consumer gate on — one definition of
+        # "open" per process (see pipeline.is_in_session for why fixed UTC hours were
+        # wrong). Evaluated at call time so the tile tracks the wall clock, not startup.
+        session_fn=lambda: is_in_session(datetime.now(timezone.utc)),
         account_summary_fn=adapter.get_account_summary,
         regime_grid_fn=(regime_scheduler.grid if regime_scheduler is not None else None),
     )

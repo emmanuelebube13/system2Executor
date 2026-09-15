@@ -52,6 +52,13 @@ class HealthReporter:
     broker_env_fn: Callable[[], str] | None = None
     account_summary_fn: Callable[[], dict[str, Any]] | None = None
     regime_grid_fn: Callable[[], list[dict[str, Any]]] | None = None
+    # Market session state: is the FX week open right now? Wired to the SAME
+    # ``pipeline.is_in_session`` guard the validator and outbound consumer gate on, so the
+    # dashboard's "market" tile can never disagree with the executor's own idea of "open".
+    # The canonical guard returns a bare bool, so the published reason is the coarse
+    # in/out pair; ``None`` (unwired) publishes ``session: null`` — "not published" must
+    # stay distinguishable from "closed".
+    session_fn: Callable[[], bool | None] | None = None
     # FIX_PLAN 2.1(d) / F-602 — the live gatekeeper approval rate against the band the
     # champion manifest declares. Exposed here for the same reason as
     # `queue.staleness_limit_sec` (F-304): the EFFECTIVE safety posture this process is
@@ -161,6 +168,7 @@ class HealthReporter:
             "open_positions": self._safe(self.open_positions_fn, []) or [],
             "model_set_id": self._safe(self.model_set_id_fn),
             "broker_env": self._safe(self.broker_env_fn, "unknown"),
+            "session": self._session_summary(),
             "account_summary": self._safe(self.account_summary_fn, {}),
             "regime": self._regime_summary(),
             "gatekeeper": self._gatekeeper_summary(),
@@ -189,6 +197,25 @@ class HealthReporter:
             "evaluations": snap.get("evaluations"),
             "window": snap.get("window"),
             "enforcing": snap.get("enforcing"),
+        }
+
+    # ----- market session (pipeline.is_in_session) ---------------------------
+    def _session_summary(self) -> dict[str, Any] | None:
+        """Market session block for the dashboard's "market" tile, or ``None`` when unwired.
+
+        ``session: null`` for an unwired/failing provider is deliberate — the same rule as
+        ``exec_shadow``: fabricating a default would let "never measured" masquerade as
+        "market closed" (or, worse, "open"). The reason is coarse (in/out) because the
+        canonical guard only returns a bool; if it ever exposes edge detail, richer reasons
+        ("saturday", "before_sunday_open", ...) belong here, not in each consumer.
+        """
+        open_ = self._safe(self.session_fn)
+        if open_ is None:
+            return None
+        return {
+            "open": bool(open_),
+            "reason": "in_session" if open_ else "out_of_session",
+            "as_of": _utc_iso(self.clock()),
         }
 
     # ----- regime (EXEC-002): live market regime per instrument x granularity -----

@@ -183,3 +183,41 @@ def test_gatekeeper_provider_raising_degrades_not_crashes():
     s = _reporter(gatekeeper_approval_fn=boom).status()
     assert s["gatekeeper"]["state"] == "unavailable"
     assert s["service"] == "system-2-execution-engine"   # rest of /status intact
+
+
+# ----- market session state on /status ---------------------------------------------
+# Wired through the canonical pipeline.is_in_session in lifecycle.py — the same guard the
+# validator gates on — so these exercise the real session boundary, not a test double.
+def _session_at(now: datetime):
+    from system2.execution.pipeline import is_in_session
+
+    return lambda: is_in_session(now)
+
+
+def test_session_block_open_midweek():
+    # T0 (Wed 2026-07-01 12:00 UTC) is deep inside the FX week.
+    s = _reporter(session_fn=_session_at(T0)).status()["session"]
+    assert s == {"open": True, "reason": "in_session", "as_of": "2026-07-01T12:00:00Z"}
+
+
+def test_session_block_closed_on_saturday():
+    sat = datetime(2026, 7, 4, 12, 0, 0, tzinfo=timezone.utc)
+    s = _reporter(session_fn=_session_at(sat)).status()["session"]
+    assert s["open"] is False
+    assert s["reason"] == "out_of_session"
+
+
+def test_session_is_null_when_unwired():
+    """No provider must publish ``session: null`` — "not published" is not "closed",
+    and it must never be fabricated into a reassuring "open"."""
+    assert _reporter().status()["session"] is None
+    assert HealthReporter(clock=lambda: T0).status()["session"] is None
+
+
+def test_session_provider_raising_degrades_to_null():
+    def boom():
+        raise RuntimeError("clock down")
+
+    s = _reporter(session_fn=boom).status()
+    assert s["session"] is None
+    assert s["service"] == "system-2-execution-engine"   # rest of /status intact
