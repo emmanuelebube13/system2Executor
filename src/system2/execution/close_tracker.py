@@ -106,7 +106,7 @@ def build_managed_trade(
         granularity=granularity or "H1",
         # No duration policy is configured anywhere today (time exits stay disabled);
         # broker-side SL/TP plus the close sweep own the exit path for now.
-        max_duration_sec=0.0,
+        max_duration_sec=48.0 * 3600.0,
         correlation_id=correlation_id or "",
         order_request_id=order_request_id,
     )
